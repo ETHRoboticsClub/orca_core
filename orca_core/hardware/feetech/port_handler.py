@@ -7,6 +7,8 @@ import platform
 
 DEFAULT_BAUDRATE = 1000000
 LATENCY_TIMER = 50 
+# A missing reply must release the CPU while preserving the packet deadline.
+SERIAL_READ_TIMEOUT_S = 0.01
 
 class PortHandler(object):
     def __init__(self, port_name):
@@ -78,7 +80,7 @@ class PortHandler(object):
         return False
 
     def getCurrentTime(self):
-        return round(time.time() * 1000000000) / 1000000.0
+        return time.monotonic() * 1000.0
 
     def getTimeSinceStart(self):
         time_since = self.getCurrentTime() - self.packet_start_time
@@ -97,7 +99,7 @@ class PortHandler(object):
             # parity = serial.PARITY_ODD,
             # stopbits = serial.STOPBITS_TWO,
             bytesize=serial.EIGHTBITS,
-            timeout=0
+            timeout=SERIAL_READ_TIMEOUT_S
         )
 
         self.is_open = True
@@ -112,4 +114,4 @@ class PortHandler(object):
         if baudrate in [4800, 9600, 14400, 19200, 38400, 57600, 115200, 128000, 250000, 500000, 1000000]:
             return baudrate
         else:
-            return -1          
+            return -1

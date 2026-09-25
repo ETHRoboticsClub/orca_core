@@ -23,6 +23,7 @@ from .feetech import (
     GroupSyncWrite,
     GroupSyncRead,
     COMM_SUCCESS,
+    COMM_RX_TIMEOUT,
     SMS_STS_TORQUE_ENABLE,
     SMS_STS_MODE,
     SMS_STS_PRESENT_POSITION_L,
@@ -542,8 +543,11 @@ class FeetechClient(MotorClient):
             for motor_id in self.motor_ids:
                 sync_read.addParam(motor_id)
 
-            if sync_read.txRxPacket() != COMM_SUCCESS:
+            result = sync_read.txRxPacket()
+            if result != COMM_SUCCESS:
                 self._flush_input_buffer()
+                if result == COMM_RX_TIMEOUT:
+                    return np.full(len(self.motor_ids), np.nan, dtype=np.float32)
                 logging.warning('Sync temp read failed, falling back to individual reads')
                 return self._read_temperature_per_motor_fallback()
 
@@ -883,6 +887,9 @@ class FeetechClient(MotorClient):
                 # Late replies from the failed sync read must never be consumed
                 # as answers to the per-motor fallback's transactions.
                 self._flush_input_buffer()
+                if result == COMM_RX_TIMEOUT:
+                    self._last_read_ok = False
+                    return MotorRead(position=positions, velocity=velocities, current=currents)
                 logging.warning('Sync read failed, falling back to individual reads')
                 return self._read_state_per_motor_fallback()
 

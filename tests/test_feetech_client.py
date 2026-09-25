@@ -21,6 +21,7 @@ from orca_core.hardware.feetech_client import (
     FeetechClient,
 )
 from orca_core.hardware.feetech import (
+    COMM_RX_TIMEOUT,
     SMS_STS_MODE,
     SMS_STS_MOVING,
     SMS_STS_PRESENT_CURRENT_L,
@@ -65,6 +66,7 @@ class FakePacketHandler:
         self.positions = dict(positions)
         self.unavailable_ids: set[int] = set()
         self.sync_fails = False
+        self.sync_result = None
         self.log: list[str] = []
         self.write1_hook = None  # callable(motor_id, address, value) -> (result, error)
         self.ofs_hook = None     # callable(motor_id, position) -> (result, error)
@@ -89,6 +91,10 @@ class FakePacketHandler:
             return self.positions[motor_id], COMM_SUCCESS, 0
         return 0, COMM_SUCCESS, 0
 
+    def read1ByteTxRx(self, motor_id, address):
+        self._record("read1")
+        return 0, COMM_RX_TIMEOUT, 0
+
     def write1ByteTxRx(self, motor_id, address, value):
         self._record("write1")
         if self.write1_hook is not None:
@@ -111,6 +117,8 @@ class FakeGroupSyncRead:
 
     def txRxPacket(self):
         self.handler._record("sync_tx")
+        if self.handler.sync_result is not None:
+            return self.handler.sync_result
         return 1 if self.handler.sync_fails else COMM_SUCCESS
 
     def isAvailable(self, motor_id, address, size):
@@ -202,6 +210,32 @@ def test_fallback_with_all_motors_answering_reports_ok(client):
         [_expected_pos(feetech, raw) for raw in (100, 200, 300)],
         rtol=1e-6,
     )
+
+
+def test_silent_bulk_read_does_not_expand_to_individual_timeouts(client):
+    feetech, handler = client
+    feetech.read_position_velocity_current()
+    cached = feetech._cached_positions.copy()
+    handler.log.clear()
+    feetech.port_handler.ser = FakeSerial(handler.log)
+    handler.sync_result = COMM_RX_TIMEOUT
+
+    read = feetech.read_position_velocity_current()
+
+    assert handler.log == ["sync_tx", "flush"]
+    assert feetech.last_read_ok is False
+    np.testing.assert_array_equal(read.position, cached)
+
+
+def test_silent_temperature_read_does_not_expand_to_each_motor(client):
+    feetech, handler = client
+    feetech.port_handler.ser = FakeSerial(handler.log)
+    handler.sync_result = COMM_RX_TIMEOUT
+
+    temperatures = feetech.read_temperature()
+
+    assert handler.log == ["sync_tx", "flush"]
+    assert np.isnan(temperatures).all()
 
 
 # ----- stale-RX flushing ----------------------------------------------------
