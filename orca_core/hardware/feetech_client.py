@@ -861,10 +861,12 @@ class FeetechClient(MotorClient):
             # Clear params for next use
             self.packet_handler.groupSyncWrite.clearParam()
 
-    def read_position_velocity_current(self) -> MotorRead:
+    def read_position_velocity_current(self, *, allow_fallback: bool = True) -> MotorRead:
         """Read position, velocity, and current for all motors in one sync packet.
 
-        Falls back to per-motor reads only if the sync transaction fails.
+        Falls back to per-motor reads only if the sync transaction fails and
+        ``allow_fallback`` is true. Health probes disable fallback to bound
+        each attempt to one bus transaction.
         Motors missing from a partial sync read keep their cached values and
         the read is reported as not ok via ``last_read_ok``.
         """
@@ -887,7 +889,7 @@ class FeetechClient(MotorClient):
                 # Late replies from the failed sync read must never be consumed
                 # as answers to the per-motor fallback's transactions.
                 self._flush_input_buffer()
-                if result == COMM_RX_TIMEOUT:
+                if result == COMM_RX_TIMEOUT or not allow_fallback:
                     self._last_read_ok = False
                     return MotorRead(position=positions, velocity=velocities, current=currents)
                 logging.warning('Sync read failed, falling back to individual reads')

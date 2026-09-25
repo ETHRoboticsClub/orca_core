@@ -21,6 +21,7 @@ from orca_core.hardware.feetech_client import (
     FeetechClient,
 )
 from orca_core.hardware.feetech import (
+    COMM_RX_CORRUPT,
     COMM_RX_TIMEOUT,
     SMS_STS_MODE,
     SMS_STS_MOVING,
@@ -225,6 +226,18 @@ def test_silent_bulk_read_does_not_expand_to_individual_timeouts(client):
     assert handler.log == ["sync_tx", "flush"]
     assert feetech.last_read_ok is False
     np.testing.assert_array_equal(read.position, cached)
+
+
+def test_health_probe_does_not_fallback_after_partial_bulk_reply(client):
+    feetech, handler = client
+    feetech.port_handler.ser = FakeSerial(handler.log)
+    handler.sync_result = COMM_RX_CORRUPT
+
+    read = feetech.read_position_velocity_current(allow_fallback=False)
+
+    assert handler.log == ["sync_tx", "flush"]
+    assert feetech.last_read_ok is False
+    np.testing.assert_array_equal(read.position, feetech._cached_positions)
 
 
 def test_silent_temperature_read_does_not_expand_to_each_motor(client):
