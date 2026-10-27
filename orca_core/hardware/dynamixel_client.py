@@ -375,7 +375,7 @@ class DynamixelClient(MotorClient):
             for mid in acked_ids:
                 self._operating_modes[mid] = mode_value
 
-    def read_position_velocity_current(self) -> MotorRead:
+    def read_position_velocity_current(self, *, allow_fallback: bool = True) -> MotorRead:
         """Return positions, velocities, and currents as a ``MotorRead`` snapshot.
 
         Overload detection is handled reactively via the Alert bit in

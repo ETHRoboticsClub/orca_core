@@ -524,16 +524,17 @@ class OrcaHand(BaseHand):
 
             return motor_pos
 
-    def read_motor_feedback(self) -> MotorFeedback:
+    def read_motor_feedback(self, *, allow_fallback: bool = True) -> MotorFeedback:
         """Read position, velocity, current, and freshness in one lock fence.
 
         Position is in motor radians, velocity in motor radians per second,
         and current in milliamperes. All tuples are aligned with ``motor_ids``.
         A false ``read_ok`` entry means that motor's values came from the
-        client's cache rather than this bus transaction.
+        client's cache rather than this bus transaction. Set ``allow_fallback``
+        false for a bounded health probe that must not retry individual motors.
         """
         with self._motor_lock:
-            state = self._motor_client.read_position_velocity_current()
+            state = self._motor_client.read_position_velocity_current(allow_fallback=allow_fallback)
             read_ok = tuple(self._motor_client.last_read_ok_by_motor)
             motor_ids = tuple(int(motor_id) for motor_id in self.config.motor_ids)
             if not (

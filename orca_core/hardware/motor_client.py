@@ -200,7 +200,7 @@ class MotorClient(ABC):
         ...
 
     @abstractmethod
-    def read_position_velocity_current(self) -> MotorRead:
+    def read_position_velocity_current(self, *, allow_fallback: bool = True) -> MotorRead:
         """Read the current position, velocity, and current for all motors.
 
         Returns:

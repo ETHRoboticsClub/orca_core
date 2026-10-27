@@ -140,3 +140,19 @@ def test_denied_public_write_preserves_motor_state_and_supports_reentrant_access
         with pytest.raises(PermissionError):
             hand.write_motor_pos_strict(hand.config.motor_ids, [0.4] * len(before), permitted=lambda: False)
         assert hand.read_motor_feedback().positions_rad == before
+
+
+def test_feedback_health_probe_preserves_no_fallback_request(connected_mock_hand, monkeypatch):
+    hand = connected_mock_hand
+    client = hand.motor_client
+    read = client.read_position_velocity_current
+    requests = []
+
+    def capture(*, allow_fallback=True):
+        requests.append(allow_fallback)
+        return read(allow_fallback=allow_fallback)
+
+    monkeypatch.setattr(client, "read_position_velocity_current", capture)
+    assert all(hand.read_motor_feedback(allow_fallback=False).read_ok)
+    assert all(hand.read_motor_feedback().read_ok)
+    assert requests == [False, True]

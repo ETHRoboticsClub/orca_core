@@ -231,7 +231,7 @@ class MockDynamixelClient(MotorClient):
             self._operating_mode[mid] = mode_value
             logging.info('Set operating mode for motor %d to %d', mid, mode_value)
 
-    def read_position_velocity_current(self) -> MotorRead:
+    def read_position_velocity_current(self, *, allow_fallback: bool = True) -> MotorRead:
         """Returns the simulated positions, velocities, and currents."""
         self.check_connected()
 
