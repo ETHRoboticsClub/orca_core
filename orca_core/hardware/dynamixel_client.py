@@ -382,7 +382,7 @@ class DynamixelClient(MotorClient):
         handle_packet_result, so no extra bulk read is needed here.
         """
         pos, vel, cur = self._pos_vel_cur_reader.read()
-        return MotorRead(position=pos, velocity=vel, current=cur)
+        return MotorRead(position=pos, velocity=vel, current=cur, temperature_c=None)
 
     @property
     def last_read_ok(self) -> bool:
@@ -1059,10 +1059,10 @@ if __name__ == '__main__':
                 print('Writing: {}'.format(way_point.tolist()))
                 dxl_client.write_desired_pos(motors, way_point)
             read_start = time.time()
-            pos_now, vel_now, cur_now = dxl_client.read_position_velocity_current()
+            state = dxl_client.read_position_velocity_current()
             if step % 5 == 0:
                 print('[{}] Frequency: {:.2f} Hz'.format(
                     step, 1.0 / (time.time() - read_start)))
-                print('> Pos: {}'.format(pos_now.tolist()))
-                print('> Vel: {}'.format(vel_now.tolist()))
-                print('> Cur: {}'.format(cur_now.tolist()))
+                print('> Pos: {}'.format(state.position.tolist()))
+                print('> Vel: {}'.format(state.velocity.tolist()))
+                print('> Cur: {}'.format(state.current.tolist()))

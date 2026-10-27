@@ -18,6 +18,7 @@ def test_coherent_motor_feedback_is_aligned_and_immutable(connected_mock_hand):
     assert feedback.positions_rad == pytest.approx(targets)
     assert len(feedback.velocities_rad_s) == len(ids)
     assert len(feedback.currents_ma) == len(ids)
+    assert feedback.temperatures_c == pytest.approx(hand.get_motor_temp())
     assert feedback.read_ok == (True,) * len(ids)
     with pytest.raises(FrozenInstanceError):
         feedback.positions_rad = ()
@@ -156,3 +157,15 @@ def test_feedback_health_probe_preserves_no_fallback_request(connected_mock_hand
     assert all(hand.read_motor_feedback(allow_fallback=False).read_ok)
     assert all(hand.read_motor_feedback().read_ok)
     assert requests == [False, True]
+
+
+def test_motor_feedback_temperature_absence_and_shape_are_explicit(connected_mock_hand, monkeypatch):
+    hand = connected_mock_hand
+    client = hand.motor_client
+    sample = client.read_position_velocity_current()
+    monkeypatch.setattr(client, "read_position_velocity_current", lambda **_: sample)
+    sample = sample._replace(temperature_c=None)
+    assert all(np.isnan(value) for value in hand.read_motor_feedback().temperatures_c)
+    sample = sample._replace(temperature_c=np.array([[30.0] for _ in hand.config.motor_ids]))
+    with pytest.raises(RuntimeError, match="configured motor IDs"):
+        hand.read_motor_feedback()

@@ -470,13 +470,15 @@ class FeetechClient(MotorClient):
     def _read_state_per_motor_fallback(self) -> MotorRead:
         """Per-motor read of position/velocity/current; used only when sync
         read fails. Fields that fail keep their cached value and the read is
-        reported as not ok via ``last_read_ok``."""
+        reported as not ok via ``last_read_ok``. Temperature is unavailable
+        because the fallback must not add another transaction per motor."""
         self._check_connected()
 
         with self._bus_lock:
             positions = self._cached_positions.copy()
             velocities = self._cached_velocities.copy()
             currents = self._cached_currents.copy()
+            temperatures = np.full(len(self.motor_ids), np.nan, dtype=np.float32)
             read_ok = True
             read_ok_by_motor = [True] * len(self.motor_ids)
 
@@ -536,7 +538,12 @@ class FeetechClient(MotorClient):
             self._cached_currents = currents.copy()
             self._last_read_ok = read_ok
             self._last_read_ok_by_motor = tuple(read_ok_by_motor)
-            return MotorRead(position=positions, velocity=velocities, current=currents)
+            return MotorRead(
+                position=positions,
+                velocity=velocities,
+                current=currents,
+                temperature_c=temperatures,
+            )
 
     def read_temperature(self) -> np.ndarray:
         """Reads the temperature for all motors via a single sync-read packet."""
@@ -901,13 +908,13 @@ class FeetechClient(MotorClient):
                 group.clearParam()
 
     def read_position_velocity_current(self, *, allow_fallback: bool = True) -> MotorRead:
-        """Read position, velocity, and current for all motors in one sync packet.
+        """Read position, velocity, current, and temperature in one sync packet.
 
         Falls back to per-motor reads only if the sync transaction fails and
         ``allow_fallback`` is true. Health probes disable fallback to bound
         each attempt to one bus transaction.
-        Motors missing from a partial sync read keep their cached values and
-        the read is reported as not ok via ``last_read_ok``.
+        Motors missing from a partial sync read keep their cached kinematic
+        values, report unknown temperature, and are not ok via ``last_read_ok``.
         """
         self._check_connected()
 
@@ -915,6 +922,7 @@ class FeetechClient(MotorClient):
             positions = self._cached_positions.copy()
             velocities = self._cached_velocities.copy()
             currents = self._cached_currents.copy()
+            temperatures = np.full(len(self.motor_ids), np.nan, dtype=np.float32)
 
             # Create sync read for position, speed, load, voltage, temp, moving, current
             # From addr 56 (position) to 70 (current_h) = 15 bytes
@@ -931,7 +939,12 @@ class FeetechClient(MotorClient):
                 if result == COMM_RX_TIMEOUT or not allow_fallback:
                     self._last_read_ok = False
                     self._last_read_ok_by_motor = tuple(False for _ in self.motor_ids)
-                    return MotorRead(position=positions, velocity=velocities, current=currents)
+                    return MotorRead(
+                        position=positions,
+                        velocity=velocities,
+                        current=currents,
+                        temperature_c=temperatures,
+                    )
                 logging.warning('Sync read failed, falling back to individual reads')
                 return self._read_state_per_motor_fallback()
 
@@ -954,6 +967,10 @@ class FeetechClient(MotorClient):
                     cur_raw = sync_read.getData(motor_id, SMS_STS_PRESENT_CURRENT_L, 2)
                     cur_signed = self.packet_handler.scs_tohost(cur_raw, 15)
                     currents[i] = cur_signed * self.cur_scale
+
+                    temperatures[i] = float(
+                        sync_read.getData(motor_id, SMS_STS_PRESENT_TEMPERATURE, 1)
+                    )
                 else:
                     read_ok = False
                     read_ok_by_motor[i] = False
@@ -966,7 +983,12 @@ class FeetechClient(MotorClient):
             self._cached_currents = currents.copy()
             self._last_read_ok = read_ok
             self._last_read_ok_by_motor = tuple(read_ok_by_motor)
-            return MotorRead(position=positions, velocity=velocities, current=currents)
+            return MotorRead(
+                position=positions,
+                velocity=velocities,
+                current=currents,
+                temperature_c=temperatures,
+            )
 
     @property
     def last_read_ok(self) -> bool:
