@@ -12,8 +12,10 @@ import math
 import os
 import threading
 import time
+from contextlib import contextmanager
+from dataclasses import dataclass
 from threading import RLock
-from typing import Dict, List, Union
+from typing import Callable, Dict, Iterator, List, Mapping, Sequence, Union
 
 import numpy as np
 
@@ -24,6 +26,7 @@ from .hardware.motor_factory import create_motor_client
 from .hardware.motor_client import MotorClient
 from .hardware.motor_resolution import persist_resolved_driver, trial_probe
 from .maintenance.calibration_routine import run_calibration
+from .maintenance.result import MaintenanceOutcome
 from .maintenance.tensioning import run_jitter, run_tension
 from .utils.utils import (
     auto_detect_port,
@@ -52,6 +55,24 @@ from .joint_position import OrcaJointPositions
 MOCK_JOINT_TO_MOTOR_RATIO = 0.007
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class MotorFeedback:
+    """One coherent motor-bus sample in configured motor order.
+
+    ``read_ok`` qualifies the bus sample at the same index: false means its
+    cached fields must not be treated as fresh. Temperature is NaN when it is
+    absent from the coherent read. Tuples keep the sample immutable after the
+    hand lock is released.
+    """
+
+    motor_ids: tuple[int, ...]
+    positions_rad: tuple[float, ...]
+    velocities_rad_s: tuple[float, ...]
+    currents_ma: tuple[float, ...]
+    temperatures_c: tuple[float, ...]
+    read_ok: tuple[bool, ...]
 
 
 class OrcaHand(BaseHand):
@@ -103,7 +124,10 @@ class OrcaHand(BaseHand):
         self._uncalibrated_warned: set = set()
 
         self._task_thread: threading.Thread = None
-        self._task_stop_event = threading.Event()
+        self._active_task_thread: threading.Thread | None = None
+        self._active_task_cancel_event: threading.Event | None = None
+        self._active_task_completion_event: threading.Event | None = None
+        self._last_task_outcome: MaintenanceOutcome[object] | None = None
         self._lock = threading.Lock()
         self._current_task = None
 
@@ -240,7 +264,11 @@ class OrcaHand(BaseHand):
             pass
 
     def connect(
-        self, interactive: bool = True, engage_feedback: bool = True
+        self,
+        interactive: bool = True,
+        engage_feedback: bool = True,
+        *,
+        allow_port_fallback: bool = True,
     ) -> tuple[bool, str]:
         """Open connection to the motor bus.
 
@@ -262,6 +290,10 @@ class OrcaHand(BaseHand):
             engage_feedback: Accepted for signature parity with the
                 joint-feedback hands; this hand has no loop to engage, so the
                 value is ignored.
+            allow_port_fallback: When ``False``, try only the concrete port in
+                ``config.port``. Never auto-detect another port or open the
+                interactive picker. ``port: auto`` therefore fails without a
+                bus attempt.
 
         Returns:
             A ``(success, message)`` tuple where *success* is ``True`` on a
@@ -272,10 +304,13 @@ class OrcaHand(BaseHand):
 
         existing_config = self.config
 
-        # ``port: auto`` keeps the tracked config hardware-agnostic; if no
-        # unique adapter is found the normal recovery cascade below runs.
         first_port = self.config.port
         if first_port == "auto":
+            if not allow_port_fallback:
+                return False, (
+                    "Connection failed: config.port is 'auto' but port fallback "
+                    "is disabled"
+                )
             detected = auto_detect_port(self.config.motor_type) or find_single_usb_serial_port()
             if detected is not None:
                 first_port = detected
@@ -287,6 +322,9 @@ class OrcaHand(BaseHand):
                 f"{self.config.port}, {self.config.baudrate} baud)"
             )
         logger.warning("Connection failed on %s: %s", first_port, error)
+
+        if not allow_port_fallback:
+            return False, f"Connection failed on configured port {first_port}: {error}"
 
         chosen_port = auto_detect_port(self.config.motor_type)
         if chosen_port and chosen_port != first_port:
@@ -488,6 +526,41 @@ class OrcaHand(BaseHand):
 
             return motor_pos
 
+    def read_motor_feedback(self, *, allow_fallback: bool = True) -> MotorFeedback:
+        """Read motor telemetry and freshness in one lock fence.
+
+        Position is in motor radians, velocity in motor radians per second,
+        current in milliamperes, and temperature in degrees Celsius. All tuples
+        are aligned with ``motor_ids``; unavailable temperatures are NaN.
+        A false ``read_ok`` entry means that motor's values came from the
+        client's cache rather than this bus transaction. Set ``allow_fallback``
+        false for a bounded health probe that must not retry individual motors.
+        """
+        with self._motor_lock:
+            state = self._motor_client.read_position_velocity_current(allow_fallback=allow_fallback)
+            read_ok = tuple(self._motor_client.last_read_ok_by_motor)
+            motor_ids = tuple(int(motor_id) for motor_id in self.config.motor_ids)
+            expected_shape = (len(motor_ids),)
+            arrays = (state.position, state.velocity, state.current)
+            if any(value.shape != expected_shape for value in arrays) or len(read_ok) != len(
+                motor_ids
+            ):
+                raise RuntimeError("motor feedback fields do not match configured motor IDs")
+            if state.temperature_c is None:
+                temperatures_c = tuple(math.nan for _ in motor_ids)
+            else:
+                if state.temperature_c.shape != expected_shape:
+                    raise RuntimeError("motor feedback fields do not match configured motor IDs")
+                temperatures_c = tuple(float(value) for value in state.temperature_c)
+            return MotorFeedback(
+                motor_ids=motor_ids,
+                positions_rad=tuple(float(value) for value in state.position),
+                velocities_rad_s=tuple(float(value) for value in state.velocity),
+                currents_ma=tuple(float(value) for value in state.current),
+                temperatures_c=temperatures_c,
+                read_ok=read_ok,
+            )
+
     def get_motor_current(self, as_dict: bool = False) -> Union[np.ndarray, dict]:
         """Read the present current drawn by each motor.
 
@@ -554,6 +627,37 @@ class OrcaHand(BaseHand):
         self._set_motor_pos(motor_pos)
         return True
 
+    def motor_to_joint_positions(
+        self, motor_positions_rad: Sequence[float]
+    ) -> OrcaJointPositions:
+        """Convert configured-order motor radians to joint degrees.
+
+        Joints without usable calibration are absent from the returned
+        :class:`OrcaJointPositions`, matching :meth:`get_joint_position`.
+        """
+        positions = np.asarray(motor_positions_rad, dtype=float)
+        if positions.ndim != 1 or len(positions) != len(self.config.motor_ids):
+            raise ValueError(
+                "motor_positions_rad must contain one value per configured motor"
+            )
+        with self._motor_lock:
+            return OrcaJointPositions.from_dict(self._motor_to_joint_pos(positions))
+
+    def joint_to_motor_positions(
+        self,
+        joint_positions_deg: OrcaJointPositions | Mapping[str, float | None] | np.ndarray,
+    ) -> tuple[float | None, ...]:
+        """Convert joint degrees to configured-order motor radians.
+
+        Missing joints and joints without usable calibration produce ``None``
+        at the corresponding motor index, matching the existing joint command
+        mapping.
+        """
+        joint_positions = self._coerce_joint_positions(joint_positions_deg)
+        with self._motor_lock:
+            mapped = self._joint_to_motor_pos(joint_positions.as_dict())
+            return tuple(None if value is None else float(value) for value in mapped)
+
     def write_motor_pos(self, motor_ids: List[int], positions) -> None:
         """Write motor-position targets for an explicit subset of motors.
 
@@ -564,6 +668,57 @@ class OrcaHand(BaseHand):
         """
         with self._motor_lock:
             self._motor_client.write_desired_pos(motor_ids, positions)
+
+    @contextmanager
+    def motor_access(self) -> Iterator[None]:
+        """Serialize a compound operation with every hand motor-bus access.
+
+        The lock is reentrant, so public hand methods may be called from this
+        context. Keep the context bounded to motor operations; waiting while
+        holding it prevents health reads, commands, and torque shutdown from
+        reaching the bus.
+        """
+        with self._motor_lock:
+            yield
+
+    def write_motor_pos_strict(
+        self,
+        motor_ids: Sequence[int],
+        positions_rad: Sequence[float],
+        *,
+        permitted: Callable[[], bool] | None = None,
+    ) -> None:
+        """Write motor-radian targets and raise on a detectable write failure.
+
+        This is the acknowledged host-transport variant of
+        :meth:`write_motor_pos`; it does not establish that a motor received or
+        applied a broadcast command. If ``permitted`` is supplied, the motor
+        client evaluates it under its bus lock immediately before sending the
+        packet. A false result raises :class:`PermissionError`; callback
+        exceptions propagate unchanged. Neither case transmits the command.
+        Ordinary writes retain their historical best-effort behavior.
+        """
+        motor_ids = list(motor_ids)
+        positions = np.asarray(positions_rad, dtype=float)
+        if positions.ndim != 1 or len(motor_ids) != len(positions):
+            raise ValueError(
+                "motor_ids and positions_rad must be aligned one-dimensional values"
+            )
+        if not motor_ids:
+            raise ValueError("motor_ids must not be empty")
+        if len(set(motor_ids)) != len(motor_ids) or any(
+            motor_id not in self.config.motor_ids for motor_id in motor_ids
+        ):
+            raise ValueError("motor_ids must be unique configured motor IDs")
+        if not np.all(np.isfinite(positions)):
+            raise ValueError("positions_rad must be finite")
+        with self._motor_lock:
+            self._motor_client.write_desired_pos(
+                motor_ids,
+                positions,
+                strict=True,
+                permitted=permitted,
+            )
 
     def init_joints(self, force_calibrate: bool = False, move_to_neutral: bool = True):
         """Prepare the hand for operation.
@@ -584,7 +739,17 @@ class OrcaHand(BaseHand):
         self.set_max_current(self.config.max_current)
 
         if not self.calibrated or force_calibrate:
-            self.calibrate()
+            outcome = self.calibrate()
+            if outcome is not None and not outcome.completed:
+                detail = "joint calibration was cancelled"
+                if outcome.cleanup_torque_disable_failed_ids:
+                    detail += (
+                        "; torque disable was not acknowledged by motor IDs "
+                        f"{list(outcome.cleanup_torque_disable_failed_ids)}"
+                    )
+                if outcome.cleanup_error is not None:
+                    detail += f"; cleanup failed: {outcome.cleanup_error}"
+                raise RuntimeError(detail)
 
         self._compute_wrap_offsets_dict()
 
@@ -747,7 +912,8 @@ class OrcaHand(BaseHand):
         joint_encoder_client=None,
         progress_callback=None,
         persist: bool | None = None,
-    ):
+        cancel_event: threading.Event | None = None,
+    ) -> MaintenanceOutcome[CalibrationResult] | None:
         """Run the joint calibration routine.
 
         Drives each joint to its mechanical limits per ``calibration_sequence``
@@ -776,12 +942,21 @@ class OrcaHand(BaseHand):
                 (default) defers to the class: real hands persist, ``Mock*``
                 hands don't. Pass ``True`` on a mock to deliberately write a
                 synthetic calibration file.
+            cancel_event: Caller-owned cooperative cancellation signal. The
+                exact event is polled without being cleared. When omitted, a
+                fresh event is created for this invocation.
+
+        Returns:
+            A terminal :class:`MaintenanceOutcome` for a blocking run. A
+            background run returns ``None`` immediately.
         """
         if persist is None:
             persist = self._persist_calibration
+        event = cancel_event if cancel_event is not None else threading.Event()
         if blocking:
-            self._task_stop_event.clear()
-            self._calibrate_and_apply(
+            return self._run_blocking_task(
+                self._calibrate_and_apply,
+                event,
                 force_wrist=force_wrist,
                 joints=joints,
                 joint_encoder_client=joint_encoder_client,
@@ -791,20 +966,23 @@ class OrcaHand(BaseHand):
         else:
             self._start_task(
                 self._calibrate_and_apply,
+                event,
                 force_wrist=force_wrist,
                 joints=joints,
                 joint_encoder_client=joint_encoder_client,
                 progress_callback=progress_callback,
                 persist=persist,
             )
+            return None
 
-    def _calibrate_and_apply(self, **kwargs):
+    def _calibrate_and_apply(
+        self, cancel_event: threading.Event, **kwargs
+    ) -> MaintenanceOutcome[CalibrationResult]:
         """Run the calibration routine and apply a completed result."""
-        result = run_calibration(
-            self, should_stop=self._task_stop_event.is_set, **kwargs
-        )
-        if result is not None:
-            self.calibration = result
+        outcome = run_calibration(self, should_stop=cancel_event.is_set, **kwargs)
+        if outcome.result is not None:
+            self.calibration = outcome.result
+        return outcome
 
     def set_neutral_position(self, num_steps: int = NUM_STEPS, step_size: float = STEP_SIZE):
         control_mode = self.config.control_mode
@@ -1066,7 +1244,8 @@ class OrcaHand(BaseHand):
         move_motors: bool = True,
         blocking: bool = True,
         progress_callback=None,
-    ):
+        cancel_event: threading.Event | None = None,
+    ) -> MaintenanceOutcome[None] | None:
         """Hold motors under current to allow manual tendon tensioning.
 
         Optionally pre-conditions the tendons with a short back-and-forth
@@ -1084,14 +1263,27 @@ class OrcaHand(BaseHand):
                 ``cleanup_failed``. Called from the tensioning thread; must
                 be fast and non-blocking. Exceptions raised by the callback
                 are swallowed.
+            cancel_event: Caller-owned cooperative cancellation signal. The
+                exact event is polled without being cleared. When omitted, a
+                fresh event is created for this invocation.
+
+        Returns:
+            A cancelled :class:`MaintenanceOutcome` after a blocking hold is
+            released. A background run returns ``None`` immediately.
         """
+        event = cancel_event if cancel_event is not None else threading.Event()
         if blocking:
-            self._task_stop_event.clear()
-            self._tension(move_motors, progress_callback=progress_callback)
+            return self._run_blocking_task(
+                self._tension, event, move_motors, progress_callback=progress_callback
+            )
         else:
             self._start_task(
-                self._tension, move_motors, progress_callback=progress_callback
+                self._tension,
+                event,
+                move_motors,
+                progress_callback=progress_callback,
             )
+            return None
 
     def jitter(
         self,
@@ -1122,16 +1314,31 @@ class OrcaHand(BaseHand):
         Raises:
             ValueError: If *amplitude* exceeds 10°.
         """
+        cancel_event = threading.Event()
         if blocking:
-            self._task_stop_event.clear()
-            self._jitter(motor_ids, amplitude, frequency, duration, include_wrist)
+            self._run_blocking_task(
+                self._jitter,
+                cancel_event,
+                motor_ids,
+                amplitude,
+                frequency,
+                duration,
+                include_wrist,
+            )
         else:
             self._start_task(
-                self._jitter, motor_ids, amplitude, frequency, duration, include_wrist
+                self._jitter,
+                cancel_event,
+                motor_ids,
+                amplitude,
+                frequency,
+                duration,
+                include_wrist,
             )
 
     def _jitter(
         self,
+        cancel_event: threading.Event,
         motor_ids: List[int] = None,
         amplitude: float = 5.0,
         frequency: float = 10.0,
@@ -1145,43 +1352,114 @@ class OrcaHand(BaseHand):
             frequency=frequency,
             duration=duration,
             include_wrist=include_wrist,
-            should_stop=self._task_stop_event.is_set,
+            should_stop=cancel_event.is_set,
         )
 
-    def _tension(self, move_motors: bool = True, progress_callback=None):
-        run_tension(
+    def _tension(
+        self,
+        cancel_event: threading.Event,
+        move_motors: bool = True,
+        progress_callback=None,
+    ) -> MaintenanceOutcome[None]:
+        return run_tension(
             self,
             move_motors=move_motors,
             progress_callback=progress_callback,
-            should_stop=self._task_stop_event.is_set,
+            should_stop=cancel_event.is_set,
         )
 
-    def _run_task(self, task_fn, *args, **kwargs):
+    def _execute_task(
+        self,
+        task_fn,
+        cancel_event: threading.Event,
+        completion_event: threading.Event,
+        *args,
+        **kwargs,
+    ):
+        try:
+            outcome = task_fn(cancel_event, *args, **kwargs)
+            if isinstance(outcome, MaintenanceOutcome):
+                with self._lock:
+                    self._last_task_outcome = outcome
+        finally:
+            with self._lock:
+                if self._active_task_thread is threading.current_thread():
+                    self._current_task = None
+                    self._active_task_thread = None
+                    self._active_task_cancel_event = None
+                    self._active_task_completion_event = None
+            completion_event.set()
+        return outcome
+
+    def _run_blocking_task(
+        self,
+        task_fn,
+        cancel_event: threading.Event,
+        *args,
+        **kwargs,
+    ):
+        current_thread = threading.current_thread()
+        completion_event = threading.Event()
         with self._lock:
-            self._task_stop_event.clear()
+            if self._active_task_thread is not None:
+                raise RuntimeError(f"Task '{self._current_task}' is already running.")
             self._current_task = task_fn.__name__
-            try:
-                task_fn(*args, **kwargs)
-            finally:
-                self._current_task = None
-
-    def _start_task(self, task_fn, *args, **kwargs):
-        if self._task_thread and self._task_thread.is_alive():
-            print(f"Task '{self._current_task}' is already running.")
-            return
-
-        self._task_thread = threading.Thread(
-            target=self._run_task, args=(task_fn,) + args, kwargs=kwargs
+            self._active_task_thread = current_thread
+            self._active_task_cancel_event = cancel_event
+            self._active_task_completion_event = completion_event
+            self._last_task_outcome = None
+        return self._execute_task(
+            task_fn, cancel_event, completion_event, *args, **kwargs
         )
-        self._task_thread.start()
+
+    def _start_task(
+        self,
+        task_fn,
+        cancel_event: threading.Event,
+        *args,
+        **kwargs,
+    ) -> None:
+        completion_event = threading.Event()
+        with self._lock:
+            if self._active_task_thread is not None:
+                print(f"Task '{self._current_task}' is already running.")
+                return
+            self._active_task_cancel_event = cancel_event
+            self._active_task_completion_event = completion_event
+            self._last_task_outcome = None
+            self._task_thread = threading.Thread(
+                target=self._execute_task,
+                args=(task_fn, cancel_event, completion_event) + args,
+                kwargs=kwargs,
+            )
+            self._active_task_thread = self._task_thread
+            self._current_task = task_fn.__name__
+            task_thread = self._task_thread
+            try:
+                task_thread.start()
+            except BaseException:
+                if self._active_task_thread is task_thread:
+                    self._current_task = None
+                    self._active_task_thread = None
+                    self._active_task_cancel_event = None
+                    self._active_task_completion_event = None
+                completion_event.set()
+                raise
 
     @property
     def task_running(self) -> bool:
-        """Whether a background task (calibration, tensioning, jitter) is running."""
-        return self._task_thread is not None and self._task_thread.is_alive()
+        """Whether a maintenance task is running on any thread."""
+        with self._lock:
+            return self._active_task_thread is not None
+
+    @property
+    def last_maintenance_outcome(self) -> MaintenanceOutcome[object] | None:
+        """Most recent terminal maintenance outcome, including background work."""
+        with self._lock:
+            return self._last_task_outcome
 
     def stop_task(self, timeout: float | None = None) -> bool:
-        """Ask a running background task to stop and wait for it to wind down.
+        """Ask a running maintenance task to stop and wait for it to wind down.
 
         Args:
             timeout: Seconds to wait for the task to finish. ``None`` waits
@@ -1192,11 +1470,21 @@ class OrcaHand(BaseHand):
             ``True`` once no task is running, ``False`` if one is still
             running when *timeout* elapsed.
         """
-        if not self.task_running:
+        with self._lock:
+            cancel_event = self._active_task_cancel_event
+            task_thread = self._active_task_thread
+            completion_event = self._active_task_completion_event
+        if task_thread is None:
             return True
-        self._task_stop_event.set()
-        self._task_thread.join(timeout)
-        stopped = not self._task_thread.is_alive()
+        if cancel_event is not None:
+            cancel_event.set()
+        if task_thread is threading.current_thread():
+            return False
+        if completion_event is None:
+            raise RuntimeError("active maintenance task has no completion event")
+        completion_event.wait(timeout)
+        with self._lock:
+            stopped = self._active_task_thread is None
         if stopped:
             logger.info("task stopped")
         else:

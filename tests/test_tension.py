@@ -45,6 +45,7 @@ def test_tension_emits_phase_events(connected_mock_hand):
 
     events = []
     holding = threading.Event()
+    cancelled = threading.Event()
 
     def cb(event):
         events.append(event)
@@ -53,12 +54,12 @@ def test_tension_emits_phase_events(connected_mock_hand):
 
     thread = threading.Thread(
         target=lambda: connected_mock_hand.tension(
-            blocking=True, progress_callback=cb
+            blocking=True, progress_callback=cb, cancel_event=cancelled
         )
     )
     thread.start()
     assert holding.wait(timeout=120), f"never reached holding: {events}"
-    connected_mock_hand._task_stop_event.set()
+    cancelled.set()
     thread.join(timeout=10)
     assert not thread.is_alive()
 

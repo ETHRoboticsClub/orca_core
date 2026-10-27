@@ -7,6 +7,8 @@ import platform
 
 DEFAULT_BAUDRATE = 1000000
 LATENCY_TIMER = 50 
+# A missing reply must release the CPU while preserving the packet deadline.
+SERIAL_READ_TIMEOUT_S = 0.01
 
 class PortHandler(object):
     def __init__(self, port_name):
@@ -28,7 +30,7 @@ class PortHandler(object):
         self.is_open = False
 
     def clearPort(self):
-        self.ser.flush()
+        self.ser.reset_input_buffer()
 
     def setPortName(self, port_name):
         self.port_name = port_name
@@ -60,11 +62,15 @@ class PortHandler(object):
             return [ord(ch) for ch in self.ser.read(length)]
 
     def writePort(self, packet):
+        self.ser.write_timeout = self._packet_timeout_millis(len(packet)) / 1000.0
         return self.ser.write(packet)
+
+    def _packet_timeout_millis(self, packet_length):
+        return self.tx_time_per_byte * (packet_length + 3.0) + LATENCY_TIMER
 
     def setPacketTimeout(self, packet_length):
         self.packet_start_time = self.getCurrentTime()
-        self.packet_timeout = (self.tx_time_per_byte * packet_length) + (self.tx_time_per_byte * 3.0) + LATENCY_TIMER
+        self.packet_timeout = self._packet_timeout_millis(packet_length)
 
     def setPacketTimeoutMillis(self, msec):
         self.packet_start_time = self.getCurrentTime()
@@ -78,7 +84,7 @@ class PortHandler(object):
         return False
 
     def getCurrentTime(self):
-        return round(time.time() * 1000000000) / 1000000.0
+        return time.monotonic() * 1000.0
 
     def getTimeSinceStart(self):
         time_since = self.getCurrentTime() - self.packet_start_time
@@ -91,20 +97,21 @@ class PortHandler(object):
         if self.is_open:
             self.closePort()
 
+        self.tx_time_per_byte = (1000.0 / self.baudrate) * 10.0
+        # writePort replaces this with the exact packet-length budget.
         self.ser = serial.Serial(
             port=self.port_name,
             baudrate=self.baudrate,
             # parity = serial.PARITY_ODD,
             # stopbits = serial.STOPBITS_TWO,
             bytesize=serial.EIGHTBITS,
-            timeout=0
+            timeout=SERIAL_READ_TIMEOUT_S,
+            write_timeout=self._packet_timeout_millis(0) / 1000.0,
         )
 
         self.is_open = True
 
         self.ser.reset_input_buffer()
-
-        self.tx_time_per_byte = (1000.0 / self.baudrate) * 10.0
 
         return True
 
@@ -112,4 +119,4 @@ class PortHandler(object):
         if baudrate in [4800, 9600, 14400, 19200, 38400, 57600, 115200, 128000, 250000, 500000, 1000000]:
             return baudrate
         else:
-            return -1          
+            return -1

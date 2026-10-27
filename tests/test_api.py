@@ -144,9 +144,9 @@ def test_calibrate_returns_before_completion_and_disconnect_aborts(
     client, hand, _ = api_env
     started = threading.Event()
 
-    def _slow_calibrate(**kwargs):
+    def _slow_calibrate(stop_event, **kwargs):
         started.set()
-        while not hand._task_stop_event.is_set():
+        while not stop_event.is_set():
             time.sleep(0.01)
 
     monkeypatch.setattr(hand, "_calibrate_and_apply", _slow_calibrate)
@@ -175,7 +175,7 @@ def test_disconnect_reports_a_wedged_task_instead_of_hanging(api_env, monkeypatc
     monkeypatch.setattr(api, "_TASK_STOP_TIMEOUT_S", 0.3)
     started, release = threading.Event(), threading.Event()
 
-    def _wedged_calibrate(**kwargs):
+    def _wedged_calibrate(stop_event, **kwargs):
         started.set()
         release.wait(20.0)
 

@@ -226,7 +226,7 @@ def test_full_failed_motor_connect_preserves_sensors_only_tactile(
     monkeypatch.setattr(
         OrcaHand,
         "connect",
-        lambda self, interactive=True: (False, "motor bus unpowered"),
+        lambda self, interactive=True, allow_port_fallback=True: (False, "motor bus unpowered"),
     )
     try:
         success, msg = hand.connect()

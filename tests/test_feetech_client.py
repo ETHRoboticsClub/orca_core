@@ -21,11 +21,14 @@ from orca_core.hardware.feetech_client import (
     FeetechClient,
 )
 from orca_core.hardware.feetech import (
+    COMM_RX_CORRUPT,
+    COMM_RX_TIMEOUT,
     SMS_STS_MODE,
     SMS_STS_MOVING,
     SMS_STS_PRESENT_CURRENT_L,
     SMS_STS_PRESENT_POSITION_L,
     SMS_STS_PRESENT_SPEED_L,
+    SMS_STS_PRESENT_TEMPERATURE,
     SMS_STS_TORQUE_ENABLE,
 )
 
@@ -65,6 +68,7 @@ class FakePacketHandler:
         self.positions = dict(positions)
         self.unavailable_ids: set[int] = set()
         self.sync_fails = False
+        self.sync_result = None
         self.log: list[str] = []
         self.write1_hook = None  # callable(motor_id, address, value) -> (result, error)
         self.ofs_hook = None     # callable(motor_id, position) -> (result, error)
@@ -89,6 +93,10 @@ class FakePacketHandler:
             return self.positions[motor_id], COMM_SUCCESS, 0
         return 0, COMM_SUCCESS, 0
 
+    def read1ByteTxRx(self, motor_id, address):
+        self._record("read1")
+        return 0, COMM_RX_TIMEOUT, 0
+
     def write1ByteTxRx(self, motor_id, address, value):
         self._record("write1")
         if self.write1_hook is not None:
@@ -111,6 +119,8 @@ class FakeGroupSyncRead:
 
     def txRxPacket(self):
         self.handler._record("sync_tx")
+        if self.handler.sync_result is not None:
+            return self.handler.sync_result
         return 1 if self.handler.sync_fails else COMM_SUCCESS
 
     def isAvailable(self, motor_id, address, size):
@@ -119,6 +129,8 @@ class FakeGroupSyncRead:
     def getData(self, motor_id, address, size):
         if address == SMS_STS_PRESENT_POSITION_L:
             return self.handler.positions[motor_id]
+        if address == SMS_STS_PRESENT_TEMPERATURE:
+            return 30 + motor_id
         assert address in (
             SMS_STS_PRESENT_SPEED_L, SMS_STS_PRESENT_CURRENT_L, SMS_STS_MOVING)
         return 0
@@ -202,6 +214,44 @@ def test_fallback_with_all_motors_answering_reports_ok(client):
         [_expected_pos(feetech, raw) for raw in (100, 200, 300)],
         rtol=1e-6,
     )
+
+
+def test_silent_bulk_read_does_not_expand_to_individual_timeouts(client):
+    feetech, handler = client
+    feetech.read_position_velocity_current()
+    cached = feetech._cached_positions.copy()
+    handler.log.clear()
+    feetech.port_handler.ser = FakeSerial(handler.log)
+    handler.sync_result = COMM_RX_TIMEOUT
+
+    read = feetech.read_position_velocity_current()
+
+    assert handler.log == ["sync_tx", "flush"]
+    assert feetech.last_read_ok is False
+    np.testing.assert_array_equal(read.position, cached)
+
+
+def test_health_probe_does_not_fallback_after_partial_bulk_reply(client):
+    feetech, handler = client
+    feetech.port_handler.ser = FakeSerial(handler.log)
+    handler.sync_result = COMM_RX_CORRUPT
+
+    read = feetech.read_position_velocity_current(allow_fallback=False)
+
+    assert handler.log == ["sync_tx", "flush"]
+    assert feetech.last_read_ok is False
+    np.testing.assert_array_equal(read.position, feetech._cached_positions)
+
+
+def test_silent_temperature_read_does_not_expand_to_each_motor(client):
+    feetech, handler = client
+    feetech.port_handler.ser = FakeSerial(handler.log)
+    handler.sync_result = COMM_RX_TIMEOUT
+
+    temperatures = feetech.read_temperature()
+
+    assert handler.log == ["sync_tx", "flush"]
+    assert np.isnan(temperatures).all()
 
 
 # ----- stale-RX flushing ----------------------------------------------------
@@ -427,3 +477,91 @@ def test_connect_succeeds_when_flock_unavailable(monkeypatch):
     finally:
         feetech._connected = False
         FeetechClient.OPEN_CLIENTS.discard(feetech)
+
+
+class StrictWritePacket:
+    def __init__(self, *, pack_ok=True, result=COMM_SUCCESS):
+        self.groupSyncWrite = self
+        self.pack_ok = pack_ok
+        self.result = result
+        self.pending = []
+        self.sent = []
+        self.clears = 0
+
+    def clearParam(self):
+        self.clears += 1
+        self.pending.clear()
+
+    def SyncWritePosEx(self, motor, position, speed, acc, torque):
+        self.pending.append((motor, position, speed, acc, torque))
+        return self.pack_ok
+
+    def txPacket(self):
+        self.sent.append(tuple(self.pending))
+        return self.result
+
+
+@pytest.mark.parametrize("pack_ok,result", [(False, COMM_SUCCESS), (True, 7)])
+def test_strict_transport_failure_raises_and_clears_packet(client, monkeypatch, pack_ok, result):
+    feetech, _ = client
+    packet = StrictWritePacket(pack_ok=pack_ok, result=result)
+    feetech.packet_handler = packet
+    monkeypatch.setattr(feetech, "_flush_input_buffer", lambda: None)
+    with pytest.raises(OSError):
+        feetech.write_desired_pos([1, 2], [-0.1, -0.2], strict=True)
+    assert packet.pending == []
+    assert packet.clears == 2
+    assert len(packet.sent) == int(pack_ok)
+    packet.pack_ok = True
+    packet.result = COMM_SUCCESS
+    feetech.write_desired_pos([3], [-0.3], strict=True)
+    assert len(packet.sent[-1]) == 1
+    assert packet.sent[-1][0][0] == 3, "failed packet must never leak into a later write"
+
+
+@pytest.mark.parametrize("raises", [False, True])
+def test_strict_permission_is_checked_under_bus_lock_before_transmit(client, raises):
+    feetech, _ = client
+    packet = StrictWritePacket()
+    feetech.packet_handler = packet
+    checks = []
+
+    def permitted():
+        checks.append(_lock_held_by_another_thread(feetech._bus_lock))
+        assert packet.pending, "permission must be checked after packing, just before TX"
+        if raises:
+            raise RuntimeError("fence callback failed")
+        return False
+
+    with pytest.raises(RuntimeError if raises else PermissionError):
+        feetech.write_desired_pos([1], [-0.1], strict=True, permitted=permitted)
+    assert checks == [True]
+    assert packet.sent == []
+    assert packet.pending == []
+
+
+def test_strict_raw_limit_overflow_does_not_transmit_or_clamp(client):
+    feetech, _ = client
+    packet = StrictWritePacket()
+    feetech.packet_handler = packet
+    with pytest.raises(ValueError, match="raw servo range"):
+        feetech.write_desired_pos([1], [100.0], strict=True)
+    assert packet.sent == []
+    assert packet.pending == []
+
+
+def test_temperature_comes_from_same_sync_packet_and_missing_motor_is_unknown(client):
+    feetech, handler = client
+    read = feetech.read_position_velocity_current(allow_fallback=False)
+    np.testing.assert_array_equal(read.temperature_c, [31, 32, 33])
+    assert handler.log == ["sync_tx"]
+    handler.unavailable_ids = {2}
+    handler.log.clear()
+    partial = feetech.read_position_velocity_current(allow_fallback=False)
+    assert partial.temperature_c[0] == 31
+    assert np.isnan(partial.temperature_c[1])
+    assert partial.temperature_c[2] == 33
+    assert "read1" not in handler.log and "read2" not in handler.log
+    handler.sync_result = COMM_RX_TIMEOUT
+    failed = feetech.read_position_velocity_current(allow_fallback=False)
+    assert np.isnan(failed.temperature_c).all()

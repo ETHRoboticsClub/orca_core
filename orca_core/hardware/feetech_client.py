@@ -12,7 +12,7 @@ import atexit
 import logging
 import threading
 import time
-from typing import Optional, Sequence, Tuple
+from typing import Callable, Optional, Sequence, Tuple
 import numpy as np
 
 from ..constants import FEETECH
@@ -23,6 +23,7 @@ from .feetech import (
     GroupSyncWrite,
     GroupSyncRead,
     COMM_SUCCESS,
+    COMM_RX_TIMEOUT,
     SMS_STS_TORQUE_ENABLE,
     SMS_STS_MODE,
     SMS_STS_PRESENT_POSITION_L,
@@ -164,6 +165,7 @@ class FeetechClient(MotorClient):
         self._cached_velocities = np.zeros(num_motors, dtype=np.float32)
         self._cached_currents = np.zeros(num_motors, dtype=np.float32)
         self._last_read_ok = True
+        self._last_read_ok_by_motor = tuple(True for _ in self.motor_ids)
 
         # Default motion parameters
         # Speed unit is 0.732 RPM per value; the motor's firmware caps speed
@@ -468,14 +470,17 @@ class FeetechClient(MotorClient):
     def _read_state_per_motor_fallback(self) -> MotorRead:
         """Per-motor read of position/velocity/current; used only when sync
         read fails. Fields that fail keep their cached value and the read is
-        reported as not ok via ``last_read_ok``."""
+        reported as not ok via ``last_read_ok``. Temperature is unavailable
+        because the fallback must not add another transaction per motor."""
         self._check_connected()
 
         with self._bus_lock:
             positions = self._cached_positions.copy()
             velocities = self._cached_velocities.copy()
             currents = self._cached_currents.copy()
+            temperatures = np.full(len(self.motor_ids), np.nan, dtype=np.float32)
             read_ok = True
+            read_ok_by_motor = [True] * len(self.motor_ids)
 
             for i, motor_id in enumerate(self.motor_ids):
                 # Read position
@@ -488,6 +493,7 @@ class FeetechClient(MotorClient):
                     positions[i] = self._raw_to_rad(pos_normalized, self.pos_scale)
                 else:
                     read_ok = False
+                    read_ok_by_motor[i] = False
                     self._flush_input_buffer()
                     logging.warning(
                         'Failed to read position for motor %d: result=%d, error=%d',
@@ -503,6 +509,7 @@ class FeetechClient(MotorClient):
                     velocities[i] = self._raw_to_rad(vel_signed, self.vel_scale)
                 else:
                     read_ok = False
+                    read_ok_by_motor[i] = False
                     self._flush_input_buffer()
                     logging.warning(
                         'Failed to read velocity for motor %d: result=%d, error=%d',
@@ -518,6 +525,7 @@ class FeetechClient(MotorClient):
                     currents[i] = cur_signed * self.cur_scale
                 else:
                     read_ok = False
+                    read_ok_by_motor[i] = False
                     self._flush_input_buffer()
                     logging.warning(
                         'Failed to read current for motor %d: result=%d, error=%d',
@@ -529,7 +537,13 @@ class FeetechClient(MotorClient):
             self._cached_velocities = velocities.copy()
             self._cached_currents = currents.copy()
             self._last_read_ok = read_ok
-            return MotorRead(position=positions, velocity=velocities, current=currents)
+            self._last_read_ok_by_motor = tuple(read_ok_by_motor)
+            return MotorRead(
+                position=positions,
+                velocity=velocities,
+                current=currents,
+                temperature_c=temperatures,
+            )
 
     def read_temperature(self) -> np.ndarray:
         """Reads the temperature for all motors via a single sync-read packet."""
@@ -542,8 +556,11 @@ class FeetechClient(MotorClient):
             for motor_id in self.motor_ids:
                 sync_read.addParam(motor_id)
 
-            if sync_read.txRxPacket() != COMM_SUCCESS:
+            result = sync_read.txRxPacket()
+            if result != COMM_SUCCESS:
                 self._flush_input_buffer()
+                if result == COMM_RX_TIMEOUT:
+                    return np.full(len(self.motor_ids), np.nan, dtype=np.float32)
                 logging.warning('Sync temp read failed, falling back to individual reads')
                 return self._read_temperature_per_motor_fallback()
 
@@ -634,6 +651,9 @@ class FeetechClient(MotorClient):
         positions: np.ndarray,
         speed: Optional[int] = None,
         torque: Optional[int] = None,
+        *,
+        strict: bool = False,
+        permitted: Optional[Callable[[], bool]] = None,
     ) -> None:
         """Writes desired positions to the motors.
 
@@ -646,7 +666,14 @@ class FeetechClient(MotorClient):
             speed: Movement speed (0.732 RPM per unit). Default ~60 = 44 RPM.
             torque: Torque limit (0-1000). Default 500. Required for motion.
         """
-        self.write_positions_sync(motor_ids, positions, speed=speed, torque=torque)
+        self.write_positions_sync(
+            motor_ids,
+            positions,
+            speed=speed,
+            torque=torque,
+            strict=strict,
+            permitted=permitted,
+        )
 
     def write_desired_current(
         self,
@@ -812,6 +839,9 @@ class FeetechClient(MotorClient):
         speed: Optional[int] = None,
         acc: Optional[int] = None,
         torque: Optional[int] = None,
+        *,
+        strict: bool = False,
+        permitted: Optional[Callable[[], bool]] = None,
     ) -> None:
         """Writes positions to multiple motors using sync write.
 
@@ -823,6 +853,12 @@ class FeetechClient(MotorClient):
             speed: Movement speed (0.732 RPM per unit). Default ~60 = 44 RPM.
             acc: Acceleration (0-254). Default 50.
             torque: Torque limit (0-1000). Default 500.
+            strict: Raise :class:`OSError` if a target cannot be packed or the
+                host fails to transmit the broadcast packet.
+            permitted: Optional final permission check performed under the bus
+                lock immediately before transmission. Returning false raises
+                :class:`PermissionError`; callback exceptions propagate. No
+                packet is transmitted in either case.
         """
         self._check_connected()
 
@@ -834,35 +870,51 @@ class FeetechClient(MotorClient):
             acc = acc if acc is not None else self._default_acc
             torque = torque if torque is not None else self._default_torque
 
-            # Clear any existing sync write params
-            self.packet_handler.groupSyncWrite.clearParam()
+            group = self.packet_handler.groupSyncWrite
+            group.clearParam()
+            try:
+                for motor_id, pos_rad in zip(motor_ids, positions):
+                    # STS servo mode uses raw 0–4095 (single rotation).
+                    requested_raw = self._rad_to_raw(pos_rad, self.pos_scale)
+                    if strict and not POS_MIN <= requested_raw <= POS_MAX:
+                        raise ValueError(
+                            f'Position target for motor {motor_id} is outside '
+                            f'the raw servo range [{POS_MIN}, {POS_MAX}]'
+                        )
+                    pos_raw = self._clamp_position(requested_raw)
 
-            for motor_id, pos_rad in zip(motor_ids, positions):
-                # STS servo mode uses raw 0–4095 (single rotation); clamp before sending.
-                pos_raw = self._clamp_position(self._rad_to_raw(pos_rad, self.pos_scale))
+                    logging.debug(
+                        'SyncWritePosEx: motor=%d, pos=%d, speed=%d, acc=%d, torque=%d',
+                        motor_id, pos_raw, speed, acc, torque
+                    )
 
-                logging.debug(
-                    'SyncWritePosEx: motor=%d, pos=%d, speed=%d, acc=%d, torque=%d',
-                    motor_id, pos_raw, speed, acc, torque
-                )
+                    packed = self.packet_handler.SyncWritePosEx(
+                        motor_id, pos_raw, speed, acc, torque
+                    )
+                    if not packed and strict:
+                        raise OSError(
+                            f'Could not pack sync-write target for motor {motor_id}'
+                        )
 
-                self.packet_handler.SyncWritePosEx(motor_id, pos_raw, speed, acc, torque)
+                if permitted is not None and not permitted():
+                    raise PermissionError('Motor write is no longer permitted')
+                result = group.txPacket()
+                if result != COMM_SUCCESS:
+                    self._flush_input_buffer()
+                    logging.error('Sync write failed: result=%d', result)
+                    if strict:
+                        raise OSError(f'Sync write failed: result={result}')
+            finally:
+                group.clearParam()
 
-            # Send the sync write packet
-            result = self.packet_handler.groupSyncWrite.txPacket()
-            if result != COMM_SUCCESS:
-                self._flush_input_buffer()
-                logging.error('Sync write failed: result=%d', result)
+    def read_position_velocity_current(self, *, allow_fallback: bool = True) -> MotorRead:
+        """Read position, velocity, current, and temperature in one sync packet.
 
-            # Clear params for next use
-            self.packet_handler.groupSyncWrite.clearParam()
-
-    def read_position_velocity_current(self) -> MotorRead:
-        """Read position, velocity, and current for all motors in one sync packet.
-
-        Falls back to per-motor reads only if the sync transaction fails.
-        Motors missing from a partial sync read keep their cached values and
-        the read is reported as not ok via ``last_read_ok``.
+        Falls back to per-motor reads only if the sync transaction fails and
+        ``allow_fallback`` is true. Health probes disable fallback to bound
+        each attempt to one bus transaction.
+        Motors missing from a partial sync read keep their cached kinematic
+        values, report unknown temperature, and are not ok via ``last_read_ok``.
         """
         self._check_connected()
 
@@ -870,6 +922,7 @@ class FeetechClient(MotorClient):
             positions = self._cached_positions.copy()
             velocities = self._cached_velocities.copy()
             currents = self._cached_currents.copy()
+            temperatures = np.full(len(self.motor_ids), np.nan, dtype=np.float32)
 
             # Create sync read for position, speed, load, voltage, temp, moving, current
             # From addr 56 (position) to 70 (current_h) = 15 bytes
@@ -883,13 +936,23 @@ class FeetechClient(MotorClient):
                 # Late replies from the failed sync read must never be consumed
                 # as answers to the per-motor fallback's transactions.
                 self._flush_input_buffer()
+                if result == COMM_RX_TIMEOUT or not allow_fallback:
+                    self._last_read_ok = False
+                    self._last_read_ok_by_motor = tuple(False for _ in self.motor_ids)
+                    return MotorRead(
+                        position=positions,
+                        velocity=velocities,
+                        current=currents,
+                        temperature_c=temperatures,
+                    )
                 logging.warning('Sync read failed, falling back to individual reads')
                 return self._read_state_per_motor_fallback()
 
             read_ok = True
+            read_ok_by_motor = [True] * len(self.motor_ids)
             for i, motor_id in enumerate(self.motor_ids):
                 available, error = sync_read.isAvailable(
-                    motor_id, SMS_STS_PRESENT_POSITION_L, 2
+                    motor_id, SMS_STS_PRESENT_POSITION_L, 15
                 )
                 if available:
                     pos_raw = sync_read.getData(motor_id, SMS_STS_PRESENT_POSITION_L, 2)
@@ -904,8 +967,13 @@ class FeetechClient(MotorClient):
                     cur_raw = sync_read.getData(motor_id, SMS_STS_PRESENT_CURRENT_L, 2)
                     cur_signed = self.packet_handler.scs_tohost(cur_raw, 15)
                     currents[i] = cur_signed * self.cur_scale
+
+                    temperatures[i] = float(
+                        sync_read.getData(motor_id, SMS_STS_PRESENT_TEMPERATURE, 1)
+                    )
                 else:
                     read_ok = False
+                    read_ok_by_motor[i] = False
                     self._flush_input_buffer()
                     logging.warning('Motor %d not available in sync read', motor_id)
 
@@ -914,11 +982,21 @@ class FeetechClient(MotorClient):
             self._cached_velocities = velocities.copy()
             self._cached_currents = currents.copy()
             self._last_read_ok = read_ok
-            return MotorRead(position=positions, velocity=velocities, current=currents)
+            self._last_read_ok_by_motor = tuple(read_ok_by_motor)
+            return MotorRead(
+                position=positions,
+                velocity=velocities,
+                current=currents,
+                temperature_c=temperatures,
+            )
 
     @property
     def last_read_ok(self) -> bool:
         return self._last_read_ok
+
+    @property
+    def last_read_ok_by_motor(self) -> tuple[bool, ...]:
+        return self._last_read_ok_by_motor
 
 
 # Register global cleanup function

@@ -12,7 +12,7 @@ from .hand_config import HandConfigValidationError
 from .hand_config import OrcaHandConfig
 from .hand_config import OrcaHandTouchConfig
 from .hand_config import canonical_joint_ids
-from .hardware_hand import MockOrcaHand, OrcaHand
+from .hardware_hand import MockOrcaHand, MotorFeedback, OrcaHand
 from .hardware_hand_sensing import (
     JointFeedbackConnectError,
     MockOrcaHandFull,
@@ -27,6 +27,7 @@ from .hardware.joint_encoder_client import EncodersNotAvailableError
 from .hardware.sensing.types import LinkHealth, TaxelData
 from .joint_position import OrcaJointPositions
 from .kinematics import HandKinematics, Transform, frames
+from .maintenance.result import MaintenanceOutcome
 from .version import LATEST_VERSION
 
 __all__ = [
@@ -41,6 +42,8 @@ __all__ = [
     "OrcaHandJointFeedback",
     "OrcaHandFull",
     "MockOrcaHand",
+    "MotorFeedback",
+    "MaintenanceOutcome",
     "MockOrcaHandTouch",
     "MockOrcaHandJointFeedback",
     "MockOrcaHandFull",

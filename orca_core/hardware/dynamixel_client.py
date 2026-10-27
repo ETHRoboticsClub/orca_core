@@ -18,7 +18,7 @@ import atexit
 import logging
 import threading
 import time
-from typing import Dict, List, Optional, Sequence, Tuple, Union
+from typing import Callable, Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 
 from ..constants import DYNAMIXEL
@@ -375,14 +375,14 @@ class DynamixelClient(MotorClient):
             for mid in acked_ids:
                 self._operating_modes[mid] = mode_value
 
-    def read_position_velocity_current(self) -> MotorRead:
+    def read_position_velocity_current(self, *, allow_fallback: bool = True) -> MotorRead:
         """Return positions, velocities, and currents as a ``MotorRead`` snapshot.
 
         Overload detection is handled reactively via the Alert bit in
         handle_packet_result, so no extra bulk read is needed here.
         """
         pos, vel, cur = self._pos_vel_cur_reader.read()
-        return MotorRead(position=pos, velocity=vel, current=cur)
+        return MotorRead(position=pos, velocity=vel, current=cur, temperature_c=None)
 
     @property
     def last_read_ok(self) -> bool:
@@ -397,8 +397,14 @@ class DynamixelClient(MotorClient):
         """Reads and returns the present temperature for each motor (in deg C)."""
         return self._temp_reader.read()
 
-    def write_desired_pos(self, motor_ids: Sequence[int],
-                          positions: np.ndarray):
+    def write_desired_pos(
+        self,
+        motor_ids: Sequence[int],
+        positions: np.ndarray,
+        *,
+        strict: bool = False,
+        permitted: Optional[Callable[[], bool]] = None,
+    ):
         """Writes the given desired positions.
 
         Args:
@@ -409,8 +415,14 @@ class DynamixelClient(MotorClient):
 
         # Convert to Dynamixel position space.
         positions = positions / self._pos_vel_cur_reader.pos_scale
-        times = self.sync_write(motor_ids, positions, ADDR_GOAL_POSITION,
-                        LEN_GOAL_POSITION)
+        times = self.sync_write(
+            motor_ids,
+            positions,
+            ADDR_GOAL_POSITION,
+            LEN_GOAL_POSITION,
+            strict=strict,
+            permitted=permitted,
+        )
         return times
 
     def write_desired_current(self, motor_ids: Sequence[int], current: np.ndarray):
@@ -453,7 +465,8 @@ class DynamixelClient(MotorClient):
 
     def sync_write(self, motor_ids: Sequence[int],
                    values: Sequence[Union[int, float]], address: int,
-                   size: int):
+                   size: int, *, strict: bool = False,
+                   permitted: Optional[Callable[[], bool]] = None):
         """Writes values to a group of motors.
 
         Args:
@@ -471,23 +484,32 @@ class DynamixelClient(MotorClient):
                     self.port_handler, self.packet_handler, address, size)
             sync_writer = self._sync_writers[key]
             times.append(time.monotonic())
-            errored_ids = []
-            for motor_id, desired_pos in zip(motor_ids, values):
-                value = signed_to_unsigned(int(desired_pos), size=size)
-                value = value.to_bytes(size, byteorder='little')
-                success = sync_writer.addParam(motor_id, value)
-                if not success:
-                    errored_ids.append(motor_id)
+            try:
+                errored_ids = []
+                for motor_id, desired_pos in zip(motor_ids, values):
+                    value = signed_to_unsigned(int(desired_pos), size=size)
+                    value = value.to_bytes(size, byteorder='little')
+                    success = sync_writer.addParam(motor_id, value)
+                    if not success:
+                        errored_ids.append(motor_id)
 
-            if errored_ids:
-                logging.error('Sync write failed for: %s', str(errored_ids))
-            times.append(time.monotonic())
+                if errored_ids:
+                    logging.error('Sync write failed for: %s', str(errored_ids))
+                    if strict:
+                        raise OSError(
+                            f'Sync write could not pack motor IDs: {errored_ids}'
+                        )
+                times.append(time.monotonic())
 
-            comm_result = sync_writer.txPacket()
-            self.handle_packet_result(comm_result, context='sync_write')
-            times.append(time.monotonic())
-
-            sync_writer.clearParam()
+                if permitted is not None and not permitted():
+                    raise PermissionError('Motor write is no longer permitted')
+                comm_result = sync_writer.txPacket()
+                success = self.handle_packet_result(comm_result, context='sync_write')
+                if strict and not success:
+                    raise OSError(f'Sync write failed: result={comm_result}')
+                times.append(time.monotonic())
+            finally:
+                sync_writer.clearParam()
         times.append(time.monotonic())
         return times
 
@@ -1037,10 +1059,10 @@ if __name__ == '__main__':
                 print('Writing: {}'.format(way_point.tolist()))
                 dxl_client.write_desired_pos(motors, way_point)
             read_start = time.time()
-            pos_now, vel_now, cur_now = dxl_client.read_position_velocity_current()
+            state = dxl_client.read_position_velocity_current()
             if step % 5 == 0:
                 print('[{}] Frequency: {:.2f} Hz'.format(
                     step, 1.0 / (time.time() - read_start)))
-                print('> Pos: {}'.format(pos_now.tolist()))
-                print('> Vel: {}'.format(vel_now.tolist()))
-                print('> Cur: {}'.format(cur_now.tolist()))
+                print('> Pos: {}'.format(state.position.tolist()))
+                print('> Vel: {}'.format(state.velocity.tolist()))
+                print('> Cur: {}'.format(state.current.tolist()))

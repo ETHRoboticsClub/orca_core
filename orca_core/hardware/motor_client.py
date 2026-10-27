@@ -10,7 +10,7 @@
 
 import logging
 from abc import ABC, abstractmethod
-from typing import ClassVar, NamedTuple, Sequence
+from typing import Callable, ClassVar, NamedTuple, Optional, Sequence
 import numpy as np
 
 
@@ -23,11 +23,11 @@ class MotionTimeoutError(MotorError):
 
 
 class MotorRead(NamedTuple):
-    """A single snapshot of position / velocity / current for all motors.
+    """A single coherent state snapshot for all motors.
 
     Each field is a 1-D numpy array indexed by the motor order configured
-    on the client. NamedTuple so callers can also unpack as
-    ``position, velocity, current = client.read_position_velocity_current()``.
+    on the client. ``temperature_c`` is ``None`` when the client's coherent
+    state transaction does not include motor temperature.
 
     A snapshot does not carry its own freshness; that is reported
     out-of-band via :attr:`MotorClient.last_read_ok`, whose coupling rules
@@ -36,6 +36,7 @@ class MotorRead(NamedTuple):
     position: np.ndarray
     velocity: np.ndarray
     current: np.ndarray
+    temperature_c: Optional[np.ndarray]
 
 
 class MotorClient(ABC):
@@ -200,12 +201,13 @@ class MotorClient(ABC):
         ...
 
     @abstractmethod
-    def read_position_velocity_current(self) -> MotorRead:
-        """Read the current position, velocity, and current for all motors.
+    def read_position_velocity_current(self, *, allow_fallback: bool = True) -> MotorRead:
+        """Read the coherent motor state available from one transaction.
 
         Returns:
             A :class:`MotorRead` snapshot. Positions are in radians,
-            velocities in rad/s, currents in mA.
+            velocities in rad/s, currents in mA, and optional temperature
+            in degrees Celsius.
         """
         ...
 
@@ -230,6 +232,16 @@ class MotorClient(ABC):
         """
         return True
 
+    @property
+    def last_read_ok_by_motor(self) -> "tuple[bool, ...]":
+        """Freshness of the most recent state read, aligned with ``motor_ids``.
+
+        Clients that can identify partial reads override this property. The
+        conservative default marks every motor stale when the client's
+        aggregate freshness flag is false.
+        """
+        return tuple(bool(self.last_read_ok) for _ in self.motor_ids)
+
     @abstractmethod
     def read_temperature(self) -> np.ndarray:
         """Reads the current temperature for all motors.
@@ -243,13 +255,24 @@ class MotorClient(ABC):
     def write_desired_pos(
         self,
         motor_ids: Sequence[int],
-        positions: np.ndarray
+        positions: np.ndarray,
+        *,
+        strict: bool = False,
+        permitted: Optional[Callable[[], bool]] = None,
     ) -> None:
         """Writes desired positions to the specified motors.
 
         Args:
             motor_ids: The motor IDs to write to.
             positions: The desired positions in radians.
+            strict: Raise when the client can determine that packing or
+                transmitting the command failed. The default preserves the
+                historical best-effort behavior.
+            permitted: Optional final permission check performed under the
+                motor client's bus lock immediately before transmission.
+                Returning false raises :class:`PermissionError`; an exception
+                raised by the callback propagates unchanged. In either case,
+                no command is transmitted.
         """
         ...
 
