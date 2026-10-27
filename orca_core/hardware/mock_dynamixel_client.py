@@ -12,7 +12,7 @@ import atexit
 import logging
 import time
 import random
-from typing import Optional, Sequence, Union, Tuple
+from typing import Callable, Optional, Sequence, Union, Tuple
 import numpy as np
 
 from ..constants import DYNAMIXEL
@@ -264,6 +264,7 @@ class MockDynamixelClient(MotorClient):
         positions: np.ndarray,
         *,
         strict: bool = False,
+        permitted: Optional[Callable[[], bool]] = None,
     ):
         """Writes the given desired positions.
 
@@ -277,6 +278,9 @@ class MockDynamixelClient(MotorClient):
         unknown_ids = [mid for mid in motor_ids if mid not in self._pos]
         if strict and unknown_ids:
             raise OSError(f'Position write has unknown motor IDs: {unknown_ids}')
+
+        if permitted is not None and not permitted():
+            raise PermissionError('Motor write is no longer permitted')
 
         for mid in motor_ids:
             if mid not in self._pos:

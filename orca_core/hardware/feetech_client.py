@@ -12,7 +12,7 @@ import atexit
 import logging
 import threading
 import time
-from typing import Optional, Sequence, Tuple
+from typing import Callable, Optional, Sequence, Tuple
 import numpy as np
 
 from ..constants import FEETECH
@@ -646,6 +646,7 @@ class FeetechClient(MotorClient):
         torque: Optional[int] = None,
         *,
         strict: bool = False,
+        permitted: Optional[Callable[[], bool]] = None,
     ) -> None:
         """Writes desired positions to the motors.
 
@@ -659,7 +660,12 @@ class FeetechClient(MotorClient):
             torque: Torque limit (0-1000). Default 500. Required for motion.
         """
         self.write_positions_sync(
-            motor_ids, positions, speed=speed, torque=torque, strict=strict
+            motor_ids,
+            positions,
+            speed=speed,
+            torque=torque,
+            strict=strict,
+            permitted=permitted,
         )
 
     def write_desired_current(
@@ -828,6 +834,7 @@ class FeetechClient(MotorClient):
         torque: Optional[int] = None,
         *,
         strict: bool = False,
+        permitted: Optional[Callable[[], bool]] = None,
     ) -> None:
         """Writes positions to multiple motors using sync write.
 
@@ -841,6 +848,10 @@ class FeetechClient(MotorClient):
             torque: Torque limit (0-1000). Default 500.
             strict: Raise :class:`OSError` if a target cannot be packed or the
                 host fails to transmit the broadcast packet.
+            permitted: Optional final permission check performed under the bus
+                lock immediately before transmission. Returning false raises
+                :class:`PermissionError`; callback exceptions propagate. No
+                packet is transmitted in either case.
         """
         self._check_connected()
 
@@ -856,8 +867,14 @@ class FeetechClient(MotorClient):
             group.clearParam()
             try:
                 for motor_id, pos_rad in zip(motor_ids, positions):
-                    # STS servo mode uses raw 0–4095 (single rotation); clamp before sending.
-                    pos_raw = self._clamp_position(self._rad_to_raw(pos_rad, self.pos_scale))
+                    # STS servo mode uses raw 0–4095 (single rotation).
+                    requested_raw = self._rad_to_raw(pos_rad, self.pos_scale)
+                    if strict and not POS_MIN <= requested_raw <= POS_MAX:
+                        raise ValueError(
+                            f'Position target for motor {motor_id} is outside '
+                            f'the raw servo range [{POS_MIN}, {POS_MAX}]'
+                        )
+                    pos_raw = self._clamp_position(requested_raw)
 
                     logging.debug(
                         'SyncWritePosEx: motor=%d, pos=%d, speed=%d, acc=%d, torque=%d',
@@ -872,6 +889,8 @@ class FeetechClient(MotorClient):
                             f'Could not pack sync-write target for motor {motor_id}'
                         )
 
+                if permitted is not None and not permitted():
+                    raise PermissionError('Motor write is no longer permitted')
                 result = group.txPacket()
                 if result != COMM_SUCCESS:
                     self._flush_input_buffer()

@@ -467,17 +467,21 @@ def test_aborted_run_preserves_previous_anchors_on_disk(calib_dir, monkeypatch):
         lambda client, *, slot, **kwargs: 5000,
     )
 
+    from threading import Event
+
+    cancel = Event()
     events = []
 
     def stop_after_first_step(event):
         events.append(event)
         if event["event"] == "step_done":
-            hand._task_stop_event.set()
+            cancel.set()
 
     hand.calibrate(
         joint_encoder_client=object(),
         progress_callback=stop_after_first_step,
         persist=True,
+        cancel_event=cancel,
     )
 
     kinds = [e["event"] for e in events]
@@ -503,9 +507,10 @@ def test_run_calibration_persist_false_leaves_disk_untouched(calib_dir):
     hand.connect()
     before = read_yaml(str(calib_path))
 
-    result = run_calibration(hand, persist=False)
+    outcome = run_calibration(hand, persist=False)
 
-    assert result is not None and result.calibrated
+    assert outcome.completed and not outcome.cancelled
+    assert outcome.result is not None and outcome.result.calibrated
     assert hand.calibration.calibrated
     assert read_yaml(str(calib_path)) == before, "persist=False wrote to disk"
 
@@ -640,16 +645,19 @@ def test_calibrate_stop_mid_drive_loop_persists_nothing(calib_dir):
     pre_ratios = dict(hand.calibration.joint_to_motor_ratios_dict)
     pre_encoders = dict(hand.calibration.joint_encoder_calibration_dict)
 
+    from threading import Event
+
+    cancel = Event()
     events = []
     orig_set_motor_pos = hand._set_motor_pos
 
     def set_and_stop(*args, **kwargs):
         # First drive-loop write: request a stop mid-drive.
-        hand._task_stop_event.set()
+        cancel.set()
         return orig_set_motor_pos(*args, **kwargs)
 
     hand._set_motor_pos = set_and_stop
-    hand.calibrate(progress_callback=events.append, persist=True)
+    hand.calibrate(progress_callback=events.append, persist=True, cancel_event=cancel)
 
     kinds = [e["event"] for e in events]
     assert kinds[-1] == "calibration_aborted"

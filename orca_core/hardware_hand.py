@@ -12,9 +12,10 @@ import math
 import os
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from threading import RLock
-from typing import Dict, List, Mapping, Sequence, Union
+from typing import Callable, Dict, Iterator, List, Mapping, Sequence, Union
 
 import numpy as np
 
@@ -659,15 +660,34 @@ class OrcaHand(BaseHand):
         with self._motor_lock:
             self._motor_client.write_desired_pos(motor_ids, positions)
 
+    @contextmanager
+    def motor_access(self) -> Iterator[None]:
+        """Serialize a compound operation with every hand motor-bus access.
+
+        The lock is reentrant, so public hand methods may be called from this
+        context. Keep the context bounded to motor operations; waiting while
+        holding it prevents health reads, commands, and torque shutdown from
+        reaching the bus.
+        """
+        with self._motor_lock:
+            yield
+
     def write_motor_pos_strict(
-        self, motor_ids: Sequence[int], positions_rad: Sequence[float]
+        self,
+        motor_ids: Sequence[int],
+        positions_rad: Sequence[float],
+        *,
+        permitted: Callable[[], bool] | None = None,
     ) -> None:
         """Write motor-radian targets and raise on a detectable write failure.
 
         This is the acknowledged host-transport variant of
         :meth:`write_motor_pos`; it does not establish that a motor received or
-        applied a broadcast command. Ordinary writes retain their historical
-        best-effort behavior.
+        applied a broadcast command. If ``permitted`` is supplied, the motor
+        client evaluates it under its bus lock immediately before sending the
+        packet. A false result raises :class:`PermissionError`; callback
+        exceptions propagate unchanged. Neither case transmits the command.
+        Ordinary writes retain their historical best-effort behavior.
         """
         motor_ids = list(motor_ids)
         positions = np.asarray(positions_rad, dtype=float)
@@ -684,7 +704,12 @@ class OrcaHand(BaseHand):
         if not np.all(np.isfinite(positions)):
             raise ValueError("positions_rad must be finite")
         with self._motor_lock:
-            self._motor_client.write_desired_pos(motor_ids, positions, strict=True)
+            self._motor_client.write_desired_pos(
+                motor_ids,
+                positions,
+                strict=True,
+                permitted=permitted,
+            )
 
     def init_joints(self, force_calibrate: bool = False, move_to_neutral: bool = True):
         """Prepare the hand for operation.

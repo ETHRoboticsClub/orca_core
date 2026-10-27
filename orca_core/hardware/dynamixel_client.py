@@ -18,7 +18,7 @@ import atexit
 import logging
 import threading
 import time
-from typing import Dict, List, Optional, Sequence, Tuple, Union
+from typing import Callable, Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 
 from ..constants import DYNAMIXEL
@@ -403,6 +403,7 @@ class DynamixelClient(MotorClient):
         positions: np.ndarray,
         *,
         strict: bool = False,
+        permitted: Optional[Callable[[], bool]] = None,
     ):
         """Writes the given desired positions.
 
@@ -420,6 +421,7 @@ class DynamixelClient(MotorClient):
             ADDR_GOAL_POSITION,
             LEN_GOAL_POSITION,
             strict=strict,
+            permitted=permitted,
         )
         return times
 
@@ -463,7 +465,8 @@ class DynamixelClient(MotorClient):
 
     def sync_write(self, motor_ids: Sequence[int],
                    values: Sequence[Union[int, float]], address: int,
-                   size: int, *, strict: bool = False):
+                   size: int, *, strict: bool = False,
+                   permitted: Optional[Callable[[], bool]] = None):
         """Writes values to a group of motors.
 
         Args:
@@ -498,6 +501,8 @@ class DynamixelClient(MotorClient):
                         )
                 times.append(time.monotonic())
 
+                if permitted is not None and not permitted():
+                    raise PermissionError('Motor write is no longer permitted')
                 comm_result = sync_writer.txPacket()
                 success = self.handle_packet_result(comm_result, context='sync_write')
                 if strict and not success:

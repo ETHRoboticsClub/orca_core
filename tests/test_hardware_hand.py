@@ -459,11 +459,13 @@ def test_raw_to_joint_angle_without_validated_side_raises_actionable_error(tmp_p
 
 
 def test_stop_task_reports_and_logs_a_well_formed_message(mock_hand, caplog):
-    def wait_for_stop():
-        mock_hand._task_stop_event.wait(5.0)
+    from threading import Event
+
+    def wait_for_stop(cancelled):
+        cancelled.wait(5.0)
 
     with caplog.at_level(logging.INFO, logger="orca_core.hardware_hand"):
-        mock_hand._start_task(wait_for_stop)
+        mock_hand._start_task(wait_for_stop, Event())
         assert mock_hand.stop_task(timeout=5.0)
         assert not mock_hand.task_running
 

@@ -474,3 +474,74 @@ def test_connect_succeeds_when_flock_unavailable(monkeypatch):
     finally:
         feetech._connected = False
         FeetechClient.OPEN_CLIENTS.discard(feetech)
+
+
+class StrictWritePacket:
+    def __init__(self, *, pack_ok=True, result=COMM_SUCCESS):
+        self.groupSyncWrite = self
+        self.pack_ok = pack_ok
+        self.result = result
+        self.pending = []
+        self.sent = []
+        self.clears = 0
+
+    def clearParam(self):
+        self.clears += 1
+        self.pending.clear()
+
+    def SyncWritePosEx(self, motor, position, speed, acc, torque):
+        self.pending.append((motor, position, speed, acc, torque))
+        return self.pack_ok
+
+    def txPacket(self):
+        self.sent.append(tuple(self.pending))
+        return self.result
+
+
+@pytest.mark.parametrize("pack_ok,result", [(False, COMM_SUCCESS), (True, 7)])
+def test_strict_transport_failure_raises_and_clears_packet(client, monkeypatch, pack_ok, result):
+    feetech, _ = client
+    packet = StrictWritePacket(pack_ok=pack_ok, result=result)
+    feetech.packet_handler = packet
+    monkeypatch.setattr(feetech, "_flush_input_buffer", lambda: None)
+    with pytest.raises(OSError):
+        feetech.write_desired_pos([1, 2], [-0.1, -0.2], strict=True)
+    assert packet.pending == []
+    assert packet.clears == 2
+    assert len(packet.sent) == int(pack_ok)
+    packet.pack_ok = True
+    packet.result = COMM_SUCCESS
+    feetech.write_desired_pos([3], [-0.3], strict=True)
+    assert len(packet.sent[-1]) == 1
+    assert packet.sent[-1][0][0] == 3, "failed packet must never leak into a later write"
+
+
+@pytest.mark.parametrize("raises", [False, True])
+def test_strict_permission_is_checked_under_bus_lock_before_transmit(client, raises):
+    feetech, _ = client
+    packet = StrictWritePacket()
+    feetech.packet_handler = packet
+    checks = []
+
+    def permitted():
+        checks.append(_lock_held_by_another_thread(feetech._bus_lock))
+        assert packet.pending, "permission must be checked after packing, just before TX"
+        if raises:
+            raise RuntimeError("fence callback failed")
+        return False
+
+    with pytest.raises(RuntimeError if raises else PermissionError):
+        feetech.write_desired_pos([1], [-0.1], strict=True, permitted=permitted)
+    assert checks == [True]
+    assert packet.sent == []
+    assert packet.pending == []
+
+
+def test_strict_raw_limit_overflow_does_not_transmit_or_clamp(client):
+    feetech, _ = client
+    packet = StrictWritePacket()
+    feetech.packet_handler = packet
+    with pytest.raises(ValueError, match="raw servo range"):
+        feetech.write_desired_pos([1], [100.0], strict=True)
+    assert packet.sent == []
+    assert packet.pending == []

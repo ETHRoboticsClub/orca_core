@@ -32,6 +32,8 @@ PACKAGE_EXPORTS = frozenset({
     "JointFeedbackConnectError",
     "LATEST_VERSION",
     "LinkHealth",
+    "MaintenanceOutcome",
+    "MotorFeedback",
     "MockOrcaHand",
     "MockOrcaHandFull",
     "MockOrcaHandJointFeedback",
@@ -81,8 +83,13 @@ ORCA_HAND = BASE_HAND | {
     "is_connected",
     "jitter",
     "joint_to_motor_ratios_dict",
+    "joint_to_motor_positions",
+    "last_maintenance_outcome",
     "motor_client",
+    "motor_access",
     "motor_limits_dict",
+    "motor_to_joint_positions",
+    "read_motor_feedback",
     "set_control_mode",
     "set_max_current",
     "stop_task",
@@ -91,6 +98,7 @@ ORCA_HAND = BASE_HAND | {
     "wait_for_motion",
     "wrist_calibrated",
     "write_motor_pos",
+    "write_motor_pos_strict",
 }
 
 TACTILE_SURFACE = frozenset({

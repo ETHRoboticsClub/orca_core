@@ -10,7 +10,7 @@
 
 import logging
 from abc import ABC, abstractmethod
-from typing import ClassVar, NamedTuple, Sequence
+from typing import Callable, ClassVar, NamedTuple, Optional, Sequence
 import numpy as np
 
 
@@ -256,6 +256,7 @@ class MotorClient(ABC):
         positions: np.ndarray,
         *,
         strict: bool = False,
+        permitted: Optional[Callable[[], bool]] = None,
     ) -> None:
         """Writes desired positions to the specified motors.
 
@@ -265,6 +266,11 @@ class MotorClient(ABC):
             strict: Raise when the client can determine that packing or
                 transmitting the command failed. The default preserves the
                 historical best-effort behavior.
+            permitted: Optional final permission check performed under the
+                motor client's bus lock immediately before transmission.
+                Returning false raises :class:`PermissionError`; an exception
+                raised by the callback propagates unchanged. In either case,
+                no command is transmitted.
         """
         ...
 
