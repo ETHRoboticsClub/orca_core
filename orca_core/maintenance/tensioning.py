@@ -79,6 +79,13 @@ def run_tension(
         should_stop = lambda: False  # noqa: E731
 
     control_mode = hand.config.control_mode
+    cancelled = False
+
+    def cancellation_requested() -> bool:
+        nonlocal cancelled
+        if not cancelled:
+            cancelled = bool(should_stop())
+        return cancelled
 
     def _restore_hand(
         *, restore_control_mode: bool = True
@@ -103,7 +110,7 @@ def run_tension(
             errors.append(f"torque disable failed: {e}")
         return failed_ids, "; ".join(errors) or None
 
-    if should_stop():
+    if cancellation_requested():
         failed_ids, cleanup_error = _restore_hand(restore_control_mode=False)
         if cleanup_error is not None or failed_ids:
             detail = cleanup_error or (
@@ -154,7 +161,7 @@ def run_tension(
                 stall_start = None
                 phase_start = time.time()
                 prev_pos = hand.get_motor_pos()
-                while not should_stop() and time.time() - phase_start < max_wind_s:
+                while not cancellation_requested() and time.time() - phase_start < max_wind_s:
                     hand._set_motor_pos(increments, rel_to_current=True)
                     time.sleep(0.1)
                     cur_pos = hand.get_motor_pos()
@@ -167,9 +174,11 @@ def run_tension(
                     else:
                         stall_start = None
                     prev_pos = cur_pos
+                if cancellation_requested():
+                    break
 
         max_cur = hand.config.max_current
-        if move_motors:
+        if move_motors and not cancellation_requested():
             # Gradually release torque so tendons don't snap back, then
             # re-engage at the relaxed position for a stable hold.
             _emit(progress_callback, "phase", phase="ramp")
@@ -177,18 +186,21 @@ def run_tension(
             hand.enable_torque()
             steps = 20
             for i in range(steps):
-                if should_stop():
+                if cancellation_requested():
                     break
                 hand.set_max_current(max_cur * (1 - (i + 1) / steps))
                 time.sleep(1.0 / steps)
-            hand.disable_torque()
-            time.sleep(0.05)
-        hand.set_max_current(max_cur)
-        hand.enable_torque()
-        logger.info("holding motors for manual tendon tensioning")
-        _emit(progress_callback, "phase", phase="holding")
-        while not should_stop():
-            time.sleep(0.1)
+            if not cancellation_requested():
+                hand.disable_torque()
+                time.sleep(0.05)
+        if not cancellation_requested():
+            hand.set_max_current(max_cur)
+            if not cancellation_requested():
+                hand.enable_torque()
+                logger.info("holding motors for manual tendon tensioning")
+                _emit(progress_callback, "phase", phase="holding")
+                while not cancellation_requested():
+                    time.sleep(0.1)
     except BaseException:
         # Cleanup failures are reported, not raised, so the original error
         # propagates instead of being masked.

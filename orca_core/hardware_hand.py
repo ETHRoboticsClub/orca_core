@@ -123,6 +123,7 @@ class OrcaHand(BaseHand):
         self._task_thread: threading.Thread = None
         self._active_task_thread: threading.Thread | None = None
         self._active_task_cancel_event: threading.Event | None = None
+        self._active_task_completion_event: threading.Event | None = None
         self._last_task_outcome: MaintenanceOutcome[object] | None = None
         self._lock = threading.Lock()
         self._current_task = None
@@ -1337,6 +1338,7 @@ class OrcaHand(BaseHand):
         self,
         task_fn,
         cancel_event: threading.Event,
+        completion_event: threading.Event,
         *args,
         **kwargs,
     ):
@@ -1351,6 +1353,8 @@ class OrcaHand(BaseHand):
                     self._current_task = None
                     self._active_task_thread = None
                     self._active_task_cancel_event = None
+                    self._active_task_completion_event = None
+            completion_event.set()
         return outcome
 
     def _run_blocking_task(
@@ -1361,14 +1365,18 @@ class OrcaHand(BaseHand):
         **kwargs,
     ):
         current_thread = threading.current_thread()
+        completion_event = threading.Event()
         with self._lock:
             if self._active_task_thread is not None:
                 raise RuntimeError(f"Task '{self._current_task}' is already running.")
             self._current_task = task_fn.__name__
             self._active_task_thread = current_thread
             self._active_task_cancel_event = cancel_event
+            self._active_task_completion_event = completion_event
             self._last_task_outcome = None
-        return self._execute_task(task_fn, cancel_event, *args, **kwargs)
+        return self._execute_task(
+            task_fn, cancel_event, completion_event, *args, **kwargs
+        )
 
     def _start_task(
         self,
@@ -1377,15 +1385,17 @@ class OrcaHand(BaseHand):
         *args,
         **kwargs,
     ) -> None:
+        completion_event = threading.Event()
         with self._lock:
             if self._active_task_thread is not None:
                 print(f"Task '{self._current_task}' is already running.")
                 return
             self._active_task_cancel_event = cancel_event
+            self._active_task_completion_event = completion_event
             self._last_task_outcome = None
             self._task_thread = threading.Thread(
                 target=self._execute_task,
-                args=(task_fn, cancel_event) + args,
+                args=(task_fn, cancel_event, completion_event) + args,
                 kwargs=kwargs,
             )
             self._active_task_thread = self._task_thread
@@ -1398,6 +1408,8 @@ class OrcaHand(BaseHand):
                     self._current_task = None
                     self._active_task_thread = None
                     self._active_task_cancel_event = None
+                    self._active_task_completion_event = None
+                completion_event.set()
                 raise
 
     @property
@@ -1427,13 +1439,16 @@ class OrcaHand(BaseHand):
         with self._lock:
             cancel_event = self._active_task_cancel_event
             task_thread = self._active_task_thread
+            completion_event = self._active_task_completion_event
         if task_thread is None:
             return True
         if cancel_event is not None:
             cancel_event.set()
         if task_thread is threading.current_thread():
             return False
-        task_thread.join(timeout)
+        if completion_event is None:
+            raise RuntimeError("active maintenance task has no completion event")
+        completion_event.wait(timeout)
         with self._lock:
             stopped = self._active_task_thread is None
         if stopped:
