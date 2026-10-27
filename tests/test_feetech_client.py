@@ -28,6 +28,7 @@ from orca_core.hardware.feetech import (
     SMS_STS_PRESENT_CURRENT_L,
     SMS_STS_PRESENT_POSITION_L,
     SMS_STS_PRESENT_SPEED_L,
+    SMS_STS_PRESENT_TEMPERATURE,
     SMS_STS_TORQUE_ENABLE,
 )
 
@@ -128,6 +129,8 @@ class FakeGroupSyncRead:
     def getData(self, motor_id, address, size):
         if address == SMS_STS_PRESENT_POSITION_L:
             return self.handler.positions[motor_id]
+        if address == SMS_STS_PRESENT_TEMPERATURE:
+            return 30 + motor_id
         assert address in (
             SMS_STS_PRESENT_SPEED_L, SMS_STS_PRESENT_CURRENT_L, SMS_STS_MOVING)
         return 0
@@ -545,3 +548,20 @@ def test_strict_raw_limit_overflow_does_not_transmit_or_clamp(client):
         feetech.write_desired_pos([1], [100.0], strict=True)
     assert packet.sent == []
     assert packet.pending == []
+
+
+def test_temperature_comes_from_same_sync_packet_and_missing_motor_is_unknown(client):
+    feetech, handler = client
+    read = feetech.read_position_velocity_current(allow_fallback=False)
+    np.testing.assert_array_equal(read.temperature_c, [31, 32, 33])
+    assert handler.log == ["sync_tx"]
+    handler.unavailable_ids = {2}
+    handler.log.clear()
+    partial = feetech.read_position_velocity_current(allow_fallback=False)
+    assert partial.temperature_c[0] == 31
+    assert np.isnan(partial.temperature_c[1])
+    assert partial.temperature_c[2] == 33
+    assert "read1" not in handler.log and "read2" not in handler.log
+    handler.sync_result = COMM_RX_TIMEOUT
+    failed = feetech.read_position_velocity_current(allow_fallback=False)
+    assert np.isnan(failed.temperature_c).all()

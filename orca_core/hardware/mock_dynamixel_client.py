@@ -238,8 +238,14 @@ class MockDynamixelClient(MotorClient):
         pos_array = np.array([self._pos[mid] for mid in self.motor_ids])
         vel_array = np.array([self._vel[mid] for mid in self.motor_ids])
         cur_array = np.array([self._cur[mid] for mid in self.motor_ids])
+        temp_array = np.array([self._temp[mid] for mid in self.motor_ids])
 
-        return MotorRead(position=pos_array, velocity=vel_array, current=cur_array)
+        return MotorRead(
+            position=pos_array,
+            velocity=vel_array,
+            current=cur_array,
+            temperature_c=temp_array,
+        )
 
     @property
     def last_read_ok(self) -> bool:
@@ -255,8 +261,7 @@ class MockDynamixelClient(MotorClient):
     def read_temperature(self) -> np.ndarray:
         """Reads and returns the simulated temperatures."""
         self.check_connected()
-        temp_array = np.array([random.uniform(40, 60) for _ in self.motor_ids])
-        return temp_array
+        return np.array([self._temp[mid] for mid in self.motor_ids])
 
     def write_desired_pos(
         self,
@@ -557,10 +562,10 @@ if __name__ == '__main__':
                 print('Writing: {}'.format(way_point.tolist()))
                 dxl_client.write_desired_pos(motors, way_point)
             read_start = time.time()
-            pos_now, vel_now, cur_now = dxl_client.read_position_velocity_current()
+            state = dxl_client.read_position_velocity_current()
             if step % 5 == 0:
                 print('[{}] Frequency: {:.2f} Hz'.format(
                     step, 1.0 / (time.time() - read_start)))
-                print('> Pos: {}'.format(pos_now.tolist()))
-                print('> Vel: {}'.format(vel_now.tolist()))
-                print('> Cur: {}'.format(cur_now.tolist()))
+                print('> Pos: {}'.format(state.position.tolist()))
+                print('> Vel: {}'.format(state.velocity.tolist()))
+                print('> Cur: {}'.format(state.current.tolist()))

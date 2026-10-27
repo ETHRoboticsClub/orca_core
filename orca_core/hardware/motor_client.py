@@ -23,11 +23,11 @@ class MotionTimeoutError(MotorError):
 
 
 class MotorRead(NamedTuple):
-    """A single snapshot of position / velocity / current for all motors.
+    """A single coherent state snapshot for all motors.
 
     Each field is a 1-D numpy array indexed by the motor order configured
-    on the client. NamedTuple so callers can also unpack as
-    ``position, velocity, current = client.read_position_velocity_current()``.
+    on the client. ``temperature_c`` is ``None`` when the client's coherent
+    state transaction does not include motor temperature.
 
     A snapshot does not carry its own freshness; that is reported
     out-of-band via :attr:`MotorClient.last_read_ok`, whose coupling rules
@@ -36,6 +36,7 @@ class MotorRead(NamedTuple):
     position: np.ndarray
     velocity: np.ndarray
     current: np.ndarray
+    temperature_c: Optional[np.ndarray]
 
 
 class MotorClient(ABC):
@@ -201,11 +202,12 @@ class MotorClient(ABC):
 
     @abstractmethod
     def read_position_velocity_current(self, *, allow_fallback: bool = True) -> MotorRead:
-        """Read the current position, velocity, and current for all motors.
+        """Read the coherent motor state available from one transaction.
 
         Returns:
             A :class:`MotorRead` snapshot. Positions are in radians,
-            velocities in rad/s, currents in mA.
+            velocities in rad/s, currents in mA, and optional temperature
+            in degrees Celsius.
         """
         ...
 

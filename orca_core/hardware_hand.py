@@ -61,15 +61,17 @@ logger = logging.getLogger(__name__)
 class MotorFeedback:
     """One coherent motor-bus sample in configured motor order.
 
-    ``read_ok`` qualifies each value at the same index: false means the
-    corresponding values are cached and must not be treated as fresh.
-    Tuples keep the sample immutable after the hand lock is released.
+    ``read_ok`` qualifies the bus sample at the same index: false means its
+    cached fields must not be treated as fresh. Temperature is NaN when it is
+    absent from the coherent read. Tuples keep the sample immutable after the
+    hand lock is released.
     """
 
     motor_ids: tuple[int, ...]
     positions_rad: tuple[float, ...]
     velocities_rad_s: tuple[float, ...]
     currents_ma: tuple[float, ...]
+    temperatures_c: tuple[float, ...]
     read_ok: tuple[bool, ...]
 
 
@@ -525,10 +527,11 @@ class OrcaHand(BaseHand):
             return motor_pos
 
     def read_motor_feedback(self, *, allow_fallback: bool = True) -> MotorFeedback:
-        """Read position, velocity, current, and freshness in one lock fence.
+        """Read motor telemetry and freshness in one lock fence.
 
         Position is in motor radians, velocity in motor radians per second,
-        and current in milliamperes. All tuples are aligned with ``motor_ids``.
+        current in milliamperes, and temperature in degrees Celsius. All tuples
+        are aligned with ``motor_ids``; unavailable temperatures are NaN.
         A false ``read_ok`` entry means that motor's values came from the
         client's cache rather than this bus transaction. Set ``allow_fallback``
         false for a bounded health probe that must not retry individual motors.
@@ -537,19 +540,24 @@ class OrcaHand(BaseHand):
             state = self._motor_client.read_position_velocity_current(allow_fallback=allow_fallback)
             read_ok = tuple(self._motor_client.last_read_ok_by_motor)
             motor_ids = tuple(int(motor_id) for motor_id in self.config.motor_ids)
-            if not (
-                len(state.position)
-                == len(state.velocity)
-                == len(state.current)
-                == len(read_ok)
-                == len(motor_ids)
+            expected_shape = (len(motor_ids),)
+            arrays = (state.position, state.velocity, state.current)
+            if any(value.shape != expected_shape for value in arrays) or len(read_ok) != len(
+                motor_ids
             ):
                 raise RuntimeError("motor feedback fields do not match configured motor IDs")
+            if state.temperature_c is None:
+                temperatures_c = tuple(math.nan for _ in motor_ids)
+            else:
+                if state.temperature_c.shape != expected_shape:
+                    raise RuntimeError("motor feedback fields do not match configured motor IDs")
+                temperatures_c = tuple(float(value) for value in state.temperature_c)
             return MotorFeedback(
                 motor_ids=motor_ids,
                 positions_rad=tuple(float(value) for value in state.position),
                 velocities_rad_s=tuple(float(value) for value in state.velocity),
                 currents_ma=tuple(float(value) for value in state.current),
+                temperatures_c=temperatures_c,
                 read_ok=read_ok,
             )
 
