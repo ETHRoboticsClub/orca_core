@@ -25,6 +25,7 @@ from typing import Callable, List, Optional, TYPE_CHECKING
 import numpy as np
 
 from ..constants import CURRENT_BASED_POSITION, WRIST
+from .result import MaintenanceOutcome
 
 if TYPE_CHECKING:
     from ..hardware_hand import OrcaHand
@@ -51,7 +52,7 @@ def run_tension(
     *,
     progress_callback: Optional[ProgressCallback] = None,
     should_stop: Optional[ShouldStop] = None,
-) -> None:
+) -> MaintenanceOutcome[None]:
     """Hold motors under current so tendons can be tensioned by hand.
 
     Optionally pre-conditions the tendons first by winding each direction
@@ -69,19 +70,57 @@ def run_tension(
             it raises are swallowed.
         should_stop: Optional ``callable() -> bool`` polled between motor
             commands; return ``True`` to leave the hold cooperatively.
+
+    Returns:
+        A cancelled maintenance outcome after the stop request has been
+        observed and cleanup has been attempted.
     """
     if should_stop is None:
         should_stop = lambda: False  # noqa: E731
 
     control_mode = hand.config.control_mode
 
-    def _restore_hand() -> None:
-        hand.set_max_current(hand.config.max_current)
-        hand.set_control_mode(control_mode)
-        hand.disable_torque()
+    def _restore_hand(
+        *, restore_control_mode: bool = True
+    ) -> tuple[tuple[int, ...], str | None]:
+        errors: list[str] = []
+        try:
+            hand.set_max_current(hand.config.max_current)
+        except Exception as e:
+            errors.append(f"restore current limit failed: {e}")
+        if restore_control_mode:
+            try:
+                hand.set_control_mode(control_mode)
+            except Exception as e:
+                errors.append(f"restore control mode failed: {e}")
 
-    hand.set_control_mode(CURRENT_BASED_POSITION)
+        failed_ids: tuple[int, ...] = ()
+        try:
+            failed_ids = tuple(
+                int(motor_id) for motor_id in (hand.disable_torque() or ())
+            )
+        except Exception as e:
+            errors.append(f"torque disable failed: {e}")
+        return failed_ids, "; ".join(errors) or None
+
+    if should_stop():
+        failed_ids, cleanup_error = _restore_hand(restore_control_mode=False)
+        if cleanup_error is not None or failed_ids:
+            detail = cleanup_error or (
+                f"torque disable was not acknowledged by motor IDs {list(failed_ids)}"
+            )
+            _emit(progress_callback, "cleanup_failed", error=detail)
+        else:
+            _emit(progress_callback, "phase", phase="released")
+        return MaintenanceOutcome(
+            completed=False,
+            cancelled=True,
+            cleanup_torque_disable_failed_ids=failed_ids,
+            cleanup_error=cleanup_error,
+        )
+
     try:
+        hand.set_control_mode(CURRENT_BASED_POSITION)
         if move_motors:
             _emit(progress_callback, "phase", phase="winding")
             motors_to_move = [
@@ -153,15 +192,31 @@ def run_tension(
     except BaseException:
         # Cleanup failures are reported, not raised, so the original error
         # propagates instead of being masked.
-        _emit(progress_callback, "phase", phase="released")
-        try:
-            _restore_hand()
-        except Exception as e:
-            _emit(progress_callback, "cleanup_failed", error=str(e))
-            logger.warning("cleanup after aborted tension routine failed: %s", e)
+        failed_ids, cleanup_error = _restore_hand()
+        if cleanup_error is not None or failed_ids:
+            detail = cleanup_error or (
+                f"torque disable was not acknowledged by motor IDs {list(failed_ids)}"
+            )
+            _emit(progress_callback, "cleanup_failed", error=detail)
+            logger.warning("cleanup after aborted tension routine failed: %s", detail)
+        else:
+            _emit(progress_callback, "phase", phase="released")
         raise
-    _emit(progress_callback, "phase", phase="released")
-    _restore_hand()
+    failed_ids, cleanup_error = _restore_hand()
+    if cleanup_error is not None or failed_ids:
+        detail = cleanup_error or (
+            f"torque disable was not acknowledged by motor IDs {list(failed_ids)}"
+        )
+        _emit(progress_callback, "cleanup_failed", error=detail)
+        logger.warning("cleanup after tension routine failed: %s", detail)
+    else:
+        _emit(progress_callback, "phase", phase="released")
+    return MaintenanceOutcome(
+        completed=False,
+        cancelled=True,
+        cleanup_torque_disable_failed_ids=failed_ids,
+        cleanup_error=cleanup_error,
+    )
 
 
 def run_jitter(

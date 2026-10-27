@@ -27,6 +27,7 @@ from .hardware.joint_encoder_client import EncodersNotAvailableError
 from .hardware.sensing.types import LinkHealth, TaxelData
 from .joint_position import OrcaJointPositions
 from .kinematics import HandKinematics, Transform, frames
+from .maintenance.result import MaintenanceOutcome
 from .version import LATEST_VERSION
 
 __all__ = [
@@ -42,6 +43,7 @@ __all__ = [
     "OrcaHandFull",
     "MockOrcaHand",
     "MotorFeedback",
+    "MaintenanceOutcome",
     "MockOrcaHandTouch",
     "MockOrcaHandJointFeedback",
     "MockOrcaHandFull",

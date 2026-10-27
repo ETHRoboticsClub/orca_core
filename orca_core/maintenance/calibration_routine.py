@@ -61,6 +61,7 @@ from ..hardware.joint_encoder_client import (
     sample_anchor_count_from_client,
 )
 from ..utils.utils import read_yaml, write_yaml_atomic
+from .result import MaintenanceOutcome
 
 if TYPE_CHECKING:
     from ..hardware_hand import OrcaHand
@@ -90,15 +91,15 @@ def run_calibration(
     progress_callback: Optional[ProgressCallback] = None,
     should_stop: Optional[ShouldStop] = None,
     persist: bool = True,
-) -> CalibrationResult | None:
-    """Run the calibration routine on ``hand`` and return the result.
+) -> MaintenanceOutcome[CalibrationResult]:
+    """Run the calibration routine on ``hand`` and return its terminal outcome.
 
-    Returns ``None`` on early exit (``should_stop`` triggered). On any exit
-    without a result — abort or exception — torque is released and the
-    configured current limit restored so the hand doesn't strain against a
-    hardstop. Partial per-step progress is committed to ``hand.calibration``
-    (and, when ``persist`` is true, ``calibration.yaml``) either way; applying
-    the *final* result to the hand is the caller's choice.
+    A cooperative stop returns a cancelled outcome. On cancellation or an
+    exception, torque is released and the configured current limit restored
+    so the hand doesn't strain against a hardstop. Partial per-step progress
+    is committed to ``hand.calibration`` (and, when ``persist`` is true,
+    ``calibration.yaml``) either way; applying the final result to the hand is
+    the caller's choice.
 
     Args:
         hand: A connected :class:`~orca_core.OrcaHand`.
@@ -126,7 +127,16 @@ def run_calibration(
     if should_stop is None:
         should_stop = lambda: False  # noqa: E731
 
-    result = None
+    if should_stop():
+        failed_ids, cleanup_error = _release_after_abort(hand, progress_callback)
+        return MaintenanceOutcome(
+            completed=False,
+            cancelled=True,
+            cleanup_torque_disable_failed_ids=failed_ids,
+            cleanup_error=cleanup_error,
+        )
+
+    result: CalibrationResult | None = None
     try:
         result = _drive_calibration(
             hand,
@@ -137,23 +147,55 @@ def run_calibration(
             should_stop=should_stop,
             persist=persist,
         )
-    finally:
-        if result is None:
-            _release_after_abort(hand, progress_callback)
-    return result
+    except BaseException:
+        _release_after_abort(hand, progress_callback)
+        raise
+
+    if result is None:
+        failed_ids, cleanup_error = _release_after_abort(hand, progress_callback)
+        return MaintenanceOutcome(
+            completed=False,
+            cancelled=True,
+            cleanup_torque_disable_failed_ids=failed_ids,
+            cleanup_error=cleanup_error,
+        )
+
+    return MaintenanceOutcome(
+        completed=True,
+        cancelled=False,
+        cleanup_torque_disable_failed_ids=(),
+        result=result,
+    )
 
 
 def _release_after_abort(
     hand: "OrcaHand", progress_callback: Optional[ProgressCallback] = None
-) -> None:
+) -> tuple[tuple[int, ...], str | None]:
     """Release torque and restore the configured current limit so the hand
     doesn't strain against a hardstop after an abnormal exit."""
+    errors: list[str] = []
     try:
         hand.set_max_current(hand.config.max_current)
-        hand.disable_torque()
     except Exception as e:
-        _emit(progress_callback, "cleanup_failed", error=str(e))
-        logger.warning("cleanup after aborted calibration failed: %s", e)
+        errors.append(f"restore current limit failed: {e}")
+
+    failed_ids: tuple[int, ...] = ()
+    try:
+        failed_ids = tuple(int(motor_id) for motor_id in (hand.disable_torque() or ()))
+    except Exception as e:
+        errors.append(f"torque disable failed: {e}")
+
+    cleanup_error = "; ".join(errors) or None
+    if cleanup_error is not None:
+        _emit(progress_callback, "cleanup_failed", error=cleanup_error)
+        logger.warning("cleanup after aborted calibration failed: %s", cleanup_error)
+    elif failed_ids:
+        _emit(
+            progress_callback,
+            "cleanup_failed",
+            error=f"torque disable was not acknowledged by motor IDs {list(failed_ids)}",
+        )
+    return failed_ids, cleanup_error
 
 
 def _build_calibration_result(

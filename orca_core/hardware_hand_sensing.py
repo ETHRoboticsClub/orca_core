@@ -208,7 +208,11 @@ class OrcaHandTouch(OrcaHand):
         )
 
     def connect(
-        self, interactive: bool = True, engage_feedback: bool = True
+        self,
+        interactive: bool = True,
+        engage_feedback: bool = True,
+        *,
+        allow_port_fallback: bool = True,
     ) -> tuple[bool, str]:
         """Open the motor bus and the tactile sensor link.
 
@@ -219,7 +223,9 @@ class OrcaHandTouch(OrcaHand):
         # orphan) a live tactile link.
         if self.is_connected() and self._tactile_client is not None:
             return True, "Already connected"
-        success, msg = super().connect(interactive)
+        success, msg = super().connect(
+            interactive, allow_port_fallback=allow_port_fallback
+        )
         if not success:
             return success, msg
         if self._tactile_client is not None:
@@ -622,7 +628,11 @@ class OrcaHandJointFeedback(OrcaHand):
     # ----- Lifecycle -------------------------------------------------------
 
     def connect(
-        self, interactive: bool = True, engage_feedback: bool = True
+        self,
+        interactive: bool = True,
+        engage_feedback: bool = True,
+        *,
+        allow_port_fallback: bool = True,
     ) -> tuple[bool, str]:
         """Open the motor bus and start the closed-loop joint feedback.
 
@@ -635,13 +645,17 @@ class OrcaHandJointFeedback(OrcaHand):
         if not engage_feedback:
             if self._loop is not None:
                 return False, _LOOP_ALREADY_RUNNING_MSG
-            return super().connect(interactive)
+            return super().connect(
+                interactive, allow_port_fallback=allow_port_fallback
+            )
         # Idempotent like the motor-only connect: never orphan a running
         # loop and encoder link by re-attaching over them.
         if self.is_connected() and self._loop is not None:
             return True, "Already connected"
         self._require_validated_feedback_side()
-        success, msg = super().connect(interactive)
+        success, msg = super().connect(
+            interactive, allow_port_fallback=allow_port_fallback
+        )
         if not success:
             return success, msg
 
@@ -940,7 +954,11 @@ class OrcaHandFull(OrcaHandTouch, OrcaHandJointFeedback):
     config_cls = OrcaHandTouchConfig
 
     def connect(
-        self, interactive: bool = True, engage_feedback: bool = True
+        self,
+        interactive: bool = True,
+        engage_feedback: bool = True,
+        *,
+        allow_port_fallback: bool = True,
     ) -> tuple[bool, str]:
         """Connect motors, tactile sensing, and the joint-feedback loop.
 
@@ -951,7 +969,9 @@ class OrcaHandFull(OrcaHandTouch, OrcaHandJointFeedback):
         open-loop hand that isn't one.
         """
         if not engage_feedback:
-            return self._connect_without_feedback(interactive)
+            return self._connect_without_feedback(
+                interactive, allow_port_fallback=allow_port_fallback
+            )
 
         # Idempotent like the motor-only connect: never orphan the running
         # loop or the live links by re-attaching over them.
@@ -964,7 +984,9 @@ class OrcaHandFull(OrcaHandTouch, OrcaHandJointFeedback):
         self._require_validated_feedback_side()
         # Motor bus only — bypass the single-sensor connect() chains so this
         # class fully controls how the tactile and encoder links are opened.
-        success, msg = OrcaHand.connect(self, interactive)
+        success, msg = OrcaHand.connect(
+            self, interactive, allow_port_fallback=allow_port_fallback
+        )
         if not success:
             # A failed motor connect must not cost a live sensors-only
             # tactile session (the documented sensors-first bring-up).
@@ -1025,14 +1047,18 @@ class OrcaHandFull(OrcaHandTouch, OrcaHandJointFeedback):
             f"| Tactile on {tactile_where}"
         )
 
-    def _connect_without_feedback(self, interactive: bool) -> tuple[bool, str]:
+    def _connect_without_feedback(
+        self, interactive: bool, *, allow_port_fallback: bool
+    ) -> tuple[bool, str]:
         """Motor bus + tactile only, mirroring :meth:`OrcaHandTouch.connect`
         but never touching the encoder link or loop."""
         if self._loop is not None:
             return False, _LOOP_ALREADY_RUNNING_MSG
         if self.is_connected() and self._tactile_client is not None:
             return True, "Already connected"
-        success, msg = OrcaHand.connect(self, interactive)
+        success, msg = OrcaHand.connect(
+            self, interactive, allow_port_fallback=allow_port_fallback
+        )
         if not success:
             return success, msg
         if self._tactile_client is not None:
