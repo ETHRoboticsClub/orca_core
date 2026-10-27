@@ -230,6 +230,16 @@ class MotorClient(ABC):
         """
         return True
 
+    @property
+    def last_read_ok_by_motor(self) -> "tuple[bool, ...]":
+        """Freshness of the most recent state read, aligned with ``motor_ids``.
+
+        Clients that can identify partial reads override this property. The
+        conservative default marks every motor stale when the client's
+        aggregate freshness flag is false.
+        """
+        return tuple(bool(self.last_read_ok) for _ in self.motor_ids)
+
     @abstractmethod
     def read_temperature(self) -> np.ndarray:
         """Reads the current temperature for all motors.
@@ -243,13 +253,18 @@ class MotorClient(ABC):
     def write_desired_pos(
         self,
         motor_ids: Sequence[int],
-        positions: np.ndarray
+        positions: np.ndarray,
+        *,
+        strict: bool = False,
     ) -> None:
         """Writes desired positions to the specified motors.
 
         Args:
             motor_ids: The motor IDs to write to.
             positions: The desired positions in radians.
+            strict: Raise when the client can determine that packing or
+                transmitting the command failed. The default preserves the
+                historical best-effort behavior.
         """
         ...
 

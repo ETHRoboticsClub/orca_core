@@ -258,8 +258,13 @@ class MockDynamixelClient(MotorClient):
         temp_array = np.array([random.uniform(40, 60) for _ in self.motor_ids])
         return temp_array
 
-    def write_desired_pos(self, motor_ids: Sequence[int],
-                          positions: np.ndarray):
+    def write_desired_pos(
+        self,
+        motor_ids: Sequence[int],
+        positions: np.ndarray,
+        *,
+        strict: bool = False,
+    ):
         """Writes the given desired positions.
 
         Args:
@@ -268,6 +273,10 @@ class MockDynamixelClient(MotorClient):
         """
         assert len(motor_ids) == len(positions)
         self.check_connected()
+
+        unknown_ids = [mid for mid in motor_ids if mid not in self._pos]
+        if strict and unknown_ids:
+            raise OSError(f'Position write has unknown motor IDs: {unknown_ids}')
 
         for mid in motor_ids:
             if mid not in self._pos:

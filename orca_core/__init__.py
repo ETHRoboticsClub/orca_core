@@ -12,7 +12,7 @@ from .hand_config import HandConfigValidationError
 from .hand_config import OrcaHandConfig
 from .hand_config import OrcaHandTouchConfig
 from .hand_config import canonical_joint_ids
-from .hardware_hand import MockOrcaHand, OrcaHand
+from .hardware_hand import MockOrcaHand, MotorFeedback, OrcaHand
 from .hardware_hand_sensing import (
     JointFeedbackConnectError,
     MockOrcaHandFull,
@@ -41,6 +41,7 @@ __all__ = [
     "OrcaHandJointFeedback",
     "OrcaHandFull",
     "MockOrcaHand",
+    "MotorFeedback",
     "MockOrcaHandTouch",
     "MockOrcaHandJointFeedback",
     "MockOrcaHandFull",

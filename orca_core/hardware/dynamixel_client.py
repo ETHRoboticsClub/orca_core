@@ -397,8 +397,13 @@ class DynamixelClient(MotorClient):
         """Reads and returns the present temperature for each motor (in deg C)."""
         return self._temp_reader.read()
 
-    def write_desired_pos(self, motor_ids: Sequence[int],
-                          positions: np.ndarray):
+    def write_desired_pos(
+        self,
+        motor_ids: Sequence[int],
+        positions: np.ndarray,
+        *,
+        strict: bool = False,
+    ):
         """Writes the given desired positions.
 
         Args:
@@ -409,8 +414,13 @@ class DynamixelClient(MotorClient):
 
         # Convert to Dynamixel position space.
         positions = positions / self._pos_vel_cur_reader.pos_scale
-        times = self.sync_write(motor_ids, positions, ADDR_GOAL_POSITION,
-                        LEN_GOAL_POSITION)
+        times = self.sync_write(
+            motor_ids,
+            positions,
+            ADDR_GOAL_POSITION,
+            LEN_GOAL_POSITION,
+            strict=strict,
+        )
         return times
 
     def write_desired_current(self, motor_ids: Sequence[int], current: np.ndarray):
@@ -453,7 +463,7 @@ class DynamixelClient(MotorClient):
 
     def sync_write(self, motor_ids: Sequence[int],
                    values: Sequence[Union[int, float]], address: int,
-                   size: int):
+                   size: int, *, strict: bool = False):
         """Writes values to a group of motors.
 
         Args:
@@ -471,23 +481,30 @@ class DynamixelClient(MotorClient):
                     self.port_handler, self.packet_handler, address, size)
             sync_writer = self._sync_writers[key]
             times.append(time.monotonic())
-            errored_ids = []
-            for motor_id, desired_pos in zip(motor_ids, values):
-                value = signed_to_unsigned(int(desired_pos), size=size)
-                value = value.to_bytes(size, byteorder='little')
-                success = sync_writer.addParam(motor_id, value)
-                if not success:
-                    errored_ids.append(motor_id)
+            try:
+                errored_ids = []
+                for motor_id, desired_pos in zip(motor_ids, values):
+                    value = signed_to_unsigned(int(desired_pos), size=size)
+                    value = value.to_bytes(size, byteorder='little')
+                    success = sync_writer.addParam(motor_id, value)
+                    if not success:
+                        errored_ids.append(motor_id)
 
-            if errored_ids:
-                logging.error('Sync write failed for: %s', str(errored_ids))
-            times.append(time.monotonic())
+                if errored_ids:
+                    logging.error('Sync write failed for: %s', str(errored_ids))
+                    if strict:
+                        raise OSError(
+                            f'Sync write could not pack motor IDs: {errored_ids}'
+                        )
+                times.append(time.monotonic())
 
-            comm_result = sync_writer.txPacket()
-            self.handle_packet_result(comm_result, context='sync_write')
-            times.append(time.monotonic())
-
-            sync_writer.clearParam()
+                comm_result = sync_writer.txPacket()
+                success = self.handle_packet_result(comm_result, context='sync_write')
+                if strict and not success:
+                    raise OSError(f'Sync write failed: result={comm_result}')
+                times.append(time.monotonic())
+            finally:
+                sync_writer.clearParam()
         times.append(time.monotonic())
         return times
 

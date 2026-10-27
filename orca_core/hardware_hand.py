@@ -12,8 +12,9 @@ import math
 import os
 import threading
 import time
+from dataclasses import dataclass
 from threading import RLock
-from typing import Dict, List, Union
+from typing import Dict, List, Mapping, Sequence, Union
 
 import numpy as np
 
@@ -52,6 +53,22 @@ from .joint_position import OrcaJointPositions
 MOCK_JOINT_TO_MOTOR_RATIO = 0.007
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class MotorFeedback:
+    """One coherent motor-bus sample in configured motor order.
+
+    ``read_ok`` qualifies each value at the same index: false means the
+    corresponding values are cached and must not be treated as fresh.
+    Tuples keep the sample immutable after the hand lock is released.
+    """
+
+    motor_ids: tuple[int, ...]
+    positions_rad: tuple[float, ...]
+    velocities_rad_s: tuple[float, ...]
+    currents_ma: tuple[float, ...]
+    read_ok: tuple[bool, ...]
 
 
 class OrcaHand(BaseHand):
@@ -488,6 +505,34 @@ class OrcaHand(BaseHand):
 
             return motor_pos
 
+    def read_motor_feedback(self) -> MotorFeedback:
+        """Read position, velocity, current, and freshness in one lock fence.
+
+        Position is in motor radians, velocity in motor radians per second,
+        and current in milliamperes. All tuples are aligned with ``motor_ids``.
+        A false ``read_ok`` entry means that motor's values came from the
+        client's cache rather than this bus transaction.
+        """
+        with self._motor_lock:
+            state = self._motor_client.read_position_velocity_current()
+            read_ok = tuple(self._motor_client.last_read_ok_by_motor)
+            motor_ids = tuple(int(motor_id) for motor_id in self.config.motor_ids)
+            if not (
+                len(state.position)
+                == len(state.velocity)
+                == len(state.current)
+                == len(read_ok)
+                == len(motor_ids)
+            ):
+                raise RuntimeError("motor feedback fields do not match configured motor IDs")
+            return MotorFeedback(
+                motor_ids=motor_ids,
+                positions_rad=tuple(float(value) for value in state.position),
+                velocities_rad_s=tuple(float(value) for value in state.velocity),
+                currents_ma=tuple(float(value) for value in state.current),
+                read_ok=read_ok,
+            )
+
     def get_motor_current(self, as_dict: bool = False) -> Union[np.ndarray, dict]:
         """Read the present current drawn by each motor.
 
@@ -554,6 +599,37 @@ class OrcaHand(BaseHand):
         self._set_motor_pos(motor_pos)
         return True
 
+    def motor_to_joint_positions(
+        self, motor_positions_rad: Sequence[float]
+    ) -> OrcaJointPositions:
+        """Convert configured-order motor radians to joint degrees.
+
+        Joints without usable calibration are absent from the returned
+        :class:`OrcaJointPositions`, matching :meth:`get_joint_position`.
+        """
+        positions = np.asarray(motor_positions_rad, dtype=float)
+        if positions.ndim != 1 or len(positions) != len(self.config.motor_ids):
+            raise ValueError(
+                "motor_positions_rad must contain one value per configured motor"
+            )
+        with self._motor_lock:
+            return OrcaJointPositions.from_dict(self._motor_to_joint_pos(positions))
+
+    def joint_to_motor_positions(
+        self,
+        joint_positions_deg: OrcaJointPositions | Mapping[str, float | None] | np.ndarray,
+    ) -> tuple[float | None, ...]:
+        """Convert joint degrees to configured-order motor radians.
+
+        Missing joints and joints without usable calibration produce ``None``
+        at the corresponding motor index, matching the existing joint command
+        mapping.
+        """
+        joint_positions = self._coerce_joint_positions(joint_positions_deg)
+        with self._motor_lock:
+            mapped = self._joint_to_motor_pos(joint_positions.as_dict())
+            return tuple(None if value is None else float(value) for value in mapped)
+
     def write_motor_pos(self, motor_ids: List[int], positions) -> None:
         """Write motor-position targets for an explicit subset of motors.
 
@@ -564,6 +640,33 @@ class OrcaHand(BaseHand):
         """
         with self._motor_lock:
             self._motor_client.write_desired_pos(motor_ids, positions)
+
+    def write_motor_pos_strict(
+        self, motor_ids: Sequence[int], positions_rad: Sequence[float]
+    ) -> None:
+        """Write motor-radian targets and raise on a detectable write failure.
+
+        This is the acknowledged host-transport variant of
+        :meth:`write_motor_pos`; it does not establish that a motor received or
+        applied a broadcast command. Ordinary writes retain their historical
+        best-effort behavior.
+        """
+        motor_ids = list(motor_ids)
+        positions = np.asarray(positions_rad, dtype=float)
+        if positions.ndim != 1 or len(motor_ids) != len(positions):
+            raise ValueError(
+                "motor_ids and positions_rad must be aligned one-dimensional values"
+            )
+        if not motor_ids:
+            raise ValueError("motor_ids must not be empty")
+        if len(set(motor_ids)) != len(motor_ids) or any(
+            motor_id not in self.config.motor_ids for motor_id in motor_ids
+        ):
+            raise ValueError("motor_ids must be unique configured motor IDs")
+        if not np.all(np.isfinite(positions)):
+            raise ValueError("positions_rad must be finite")
+        with self._motor_lock:
+            self._motor_client.write_desired_pos(motor_ids, positions, strict=True)
 
     def init_joints(self, force_calibrate: bool = False, move_to_neutral: bool = True):
         """Prepare the hand for operation.
