@@ -1,5 +1,7 @@
 #!/usr/bin/env python
 
+import serial
+
 from .scservo_def import *
 
 TXPACKET_MAX_LEN = 250
@@ -142,8 +144,14 @@ class protocol_packet_handler(object):
         #print "[TxPacket] %r" % txpacket
 
         # tx packet
-        self.portHandler.clearPort()
-        written_packet_length = self.portHandler.writePort(txpacket)
+        try:
+            self.portHandler.clearPort()
+            written_packet_length = self.portHandler.writePort(txpacket)
+        except (serial.SerialException, OSError):
+            # SerialTimeoutException is a SerialException. A failed transmit
+            # cannot retain packet ownership and poison the next transaction.
+            self.portHandler.is_using = False
+            return COMM_TX_FAIL
         if total_packet_length != written_packet_length:
             self.portHandler.is_using = False
             return COMM_TX_FAIL
@@ -159,7 +167,11 @@ class protocol_packet_handler(object):
         wait_length = 6  # minimum length (HEADER0 HEADER1 ID LENGTH ERROR CHKSUM)
 
         while True:
-            rxpacket.extend(self.portHandler.readPort(wait_length - rx_length))
+            try:
+                rxpacket.extend(self.portHandler.readPort(wait_length - rx_length))
+            except (serial.SerialException, OSError):
+                self.portHandler.is_using = False
+                return rxpacket, COMM_RX_FAIL
             rx_length = len(rxpacket)
             if rx_length >= wait_length:
                 # find packet header
@@ -497,7 +509,11 @@ class protocol_packet_handler(object):
         rxpacket = []
         rx_length = 0
         while True:
-            rxpacket.extend(self.portHandler.readPort(wait_length - rx_length))
+            try:
+                rxpacket.extend(self.portHandler.readPort(wait_length - rx_length))
+            except (serial.SerialException, OSError):
+                self.portHandler.is_using = False
+                return COMM_RX_FAIL, rxpacket
             rx_length = len(rxpacket)
             if rx_length >= wait_length:
                 result = COMM_SUCCESS
